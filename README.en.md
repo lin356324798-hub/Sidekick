@@ -402,4 +402,6 @@ Use the `skill-creator` skill to create a new `.md` in `skills/`, or let the AI 
 
 ## License
 
-A personal project. Take it and use it however you like.
+**MIT** (see [LICENSE](LICENSE)) — free to use, modify and redistribute, including in closed-source commercial products, as long as the copyright notice is kept.
+
+In short: take it, use it however you like, no liability.

@@ -402,4 +402,6 @@ Usa la skill `skill-creator` para crear un nuevo `.md` en `skills/`, o deja que 
 
 ## Licencia
 
-Un proyecto personal. Tómalo y úsalo como quieras.
+**Licencia MIT** (ver [LICENSE](LICENSE)) — puedes usarlo, modificarlo y redistribuirlo libremente, incluso en productos comerciales de código cerrado, siempre que conserves el aviso de copyright.
+
+En resumen: tómalo y úsalo como quieras, sin garantías.

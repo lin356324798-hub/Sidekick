@@ -401,4 +401,6 @@ python3 -c "import json;print('\n'.join(f'{e[\"time\"]}  {e[\"summary\"].splitli
 
 ## 许可
 
-个人自用项目，随意取用。
+本项目采用 **MIT 协议**（见 [LICENSE](LICENSE)）—— 你可以自由使用、修改、分发，甚至用于闭源商业产品，只需保留版权声明。
+
+简单说：拿去用，随便用，出事别找我。

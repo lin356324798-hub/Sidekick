@@ -402,4 +402,6 @@ Nutze den `skill-creator`-Skill, um eine neue `.md` in `skills/` anzulegen, oder
 
 ## Lizenz
 
-Ein persönliches Projekt. Nimm es und nutze es, wie du willst.
+**MIT-Lizenz** (siehe [LICENSE](LICENSE)) — frei nutzbar, veränderbar und weitergebbar, auch in kommerziellen Closed-Source-Produkten, solange der Copyright-Hinweis erhalten bleibt.
+
+Kurz gesagt: nimm es und nutze es, wie du willst, ohne Gewähr.
