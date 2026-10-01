@@ -50,7 +50,7 @@ say "3/6 安装文件"
 cp "$SRC/agent.py" "$DST/agent.py"
 ok "agent.py"
 
-for f in mcp_call.py wps.py wps_mcp_server.py; do
+for f in mcp_call.py wps.py wps_mcp_server.py cdp.py chrome_read.py hdc.py; do
   if [ -f "$SRC/$f" ]; then cp "$SRC/$f" "$DST/$f"; ok "$f"; fi
 done
 

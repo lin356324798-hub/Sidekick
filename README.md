@@ -242,6 +242,12 @@ python3 ~/.termux-agent/agent.py autostart
 ```
 ~/.termux-agent/
 ├── agent.py          主程序（单文件，纯标准库）
+├── cdp.py            CDP 客户端（浏览器调试抓取，ui-debug / chrome-cdp 技能用）
+├── chrome_read.py    Chrome 网页数据读取（chrome-cdp 技能用）
+├── hdc.py            HDC 协议实现（hdcmate 工具用，447 行）
+├── wps.py            WPS 文档生成
+├── wps_mcp_server.py WPS 本地 MCP 服务
+├── mcp_call.py       MCP 调用辅助
 ├── config.json       配置（含 API Key，权限 600）
 ├── skills/           技能文档（36 个）
 ├── sessions/         会话记录
