@@ -1,8 +1,10 @@
 # Sidekick
 
-**A local AI agent that runs on your Android device.** One Python file, zero third-party dependencies, a browser as its UI.
+**Your Android device, as of today, is home to an AI agent.** One Python file, zero third-party dependencies, a browser as its UI.
 
-It doesn't just chat — it **actually operates your device**: reading and writing files, running commands, editing code, browsing the web, controlling your phone, building spreadsheets, editing images.
+It doesn't keep you company — it **gets its hands dirty and does the work**: files, commands, code, the web, your phone, spreadsheets, images.
+
+No server, no account, no subscription. It runs on your own device with no middleman — and if you want to go fully offline, just point it at a local model on your LAN.
 
 > `Sidekick` is just the factory default name. Rename it to anything you like on the "Identity" page.
 
@@ -27,14 +29,16 @@ It doesn't just chat — it **actually operates your device**: reading and writi
 
 ## What is this
 
-An AI agent that lives on your Android phone or tablet, used through a browser interface.
+An AI agent that lives on your Android phone or tablet. You talk to it through a browser; it works on the device itself.
 
-It is built around four ideas:
+Four things make it different from everything else you've installed:
 
-- **Foolproof install** — two commands, no third step
-- **Evolves itself every day** — no maintenance, no remote updates
-- **Fixes its own bugs** — with backup, syntax check and auto-rollback
-- **Resumes after interruption** — long tasks survive being killed
+- **Two commands and you're in** — no hidden step 2.5
+- **It quietly gets stronger every day** — you do nothing, nobody pushes you updates
+- **It gets back up when it crashes** — backup, syntax check, auto-rollback
+- **Kill it mid-task, it picks up where it left off** — long jobs survive being interrupted
+
+And because it grows from *your* usage, **every device ends up with a different agent — yours will look like you.**
 
 Read the full description in your language above. The English version is [here](README.en.md).
 

@@ -1,8 +1,10 @@
 # Sidekick
 
-**A local AI agent that runs on your Android device.** One Python file, zero third-party dependencies, a browser as its UI.
+**Your Android device, as of today, is home to an AI agent.** One Python file, zero third-party dependencies, a browser as its UI.
 
-It doesn't just chat — it **actually operates your device**: reading and writing files, running commands, editing code, browsing the web, controlling your phone, building spreadsheets, editing images.
+It doesn't keep you company — it **gets its hands dirty and does the work**: files, commands, code, the web, your phone, spreadsheets, images.
+
+**No server, no account, no subscription.** It runs on your own device with no middleman in between — and if you want to go fully offline, just point it at a local model on your LAN.
 
 > `Sidekick` is just the factory default name. Rename it to anything you like on the "Identity" page.
 
@@ -12,20 +14,20 @@ It doesn't just chat — it **actually operates your device**: reading and writi
 
 ## What makes it different
 
-### 1. Foolproof install — two commands, no third step
+### 1. Two commands and you're in — faster than boiling water
 
-No Python knowledge needed. No environment setup. No database. Install Termux, paste two lines, open the browser, and you're done.
+No Python knowledge needed. No environment setup. No database. Install Termux, paste two lines, open the browser, and you're done. **No hidden step 2.5. No trap door.**
 
 ```bash
 pkg install -y python curl
 bash install.sh
 ```
 
-No Docker, no Node, no dependency conflicts. It uses **only the Python standard library**, so upstream updates can't break it — if it runs today, it'll still run three years from now.
+No Docker, no Node, no dependency conflicts. It uses **only the Python standard library**, so upstream updates can't break it — if it runs today, it'll still run three years from now. Other people patch dependencies; you get on with the work.
 
-### 2. It evolves itself every day — no maintenance, no remote updates
+### 2. It quietly gets stronger every day — and you do nothing
 
-This is the most unusual part: **it gets a little better every day, and nobody needs to push you an update.**
+This is the most unusual part: **it gets a little better every day, and nobody needs to push you an update.** Most software is at its best the day you install it, then ages. This one is at its weakest the day you install it, then grows.
 
 Each day it reviews its own performance, finds something worth improving, makes the change, and writes it to a log. Here's real work it did on its own:
 
@@ -38,11 +40,11 @@ Each day it reviews its own performance, finds something worth improving, makes 
 
 > These aren't marketing lines. They're excerpts from its own evolution log. Once it's running on your machine, it grows improvements that are **relevant to you**.
 
-**What this means:** your agent and someone else's agent will diverge after a month of use. If you often have it organize photo albums, it evolves stronger image handling. If you use it for reports, it evolves a smoother document workflow. **Every device raises a one-of-a-kind agent.**
+**What this means:** your agent and someone else's agent will look **nothing alike** after a month of use. If you often have it organize photo albums, it evolves stronger image handling. If you use it for reports, it evolves a smoother document workflow. **Every device raises a one-of-a-kind agent — there will never be a second one like yours.**
 
-### 3. It fixes its own bugs — and you can watch it diagnose
+### 3. When it falls, it gets back up — and you can watch the surgery
 
-When the program crashes, it doesn't just leave a stack trace. It has a built-in **self-healing** mechanism: detect the crash → read its own logs to locate it → fix the code → verify → log the outcome.
+When the program crashes, it doesn't just leave a stack trace. It has a built-in **self-healing** mechanism: detect the crash → read its own logs to locate it → fix the code → verify → log the outcome. **It crashes at 3 a.m.; it's patched itself before sunrise. You sleep, it works.**
 
 A real record (from `selfheal.json`):
 
