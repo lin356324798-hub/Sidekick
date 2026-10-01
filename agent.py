@@ -1064,6 +1064,10 @@ def trim_old_reasoning(messages: list, keep: int = 1) -> list:
 
 
 def build_system_prompt(cfg: dict) -> str:
+    # 界面语言为英文时，整段系统提示词改用英文版（见 build_system_prompt_en）。
+    # 模型收到的指令与用户界面语言一致，回复语言也随之一致。
+    if str(globals().get("UI_LANG") or "zh").lower().startswith("en"):
+        return build_system_prompt_en(cfg)
     if local_lite(cfg):
         name = (cfg.get("assistant_name") or "Sidekick").strip()
         lang = cfg.get("language") or "中文"
@@ -1198,6 +1202,180 @@ def build_system_prompt(cfg: dict) -> str:
         "适合画布局图、示意图、简单图形。\n"
         "    简单问题一句话说清就行，别为了好看硬塞卡片和表格。\n\n"
         "当前运行环境：\n" + "\n".join(env_lines)
+    )
+
+
+def build_system_prompt_en(cfg: dict) -> str:
+    """系统提示词的英文版。与中文版内容一一对应，供界面语言为英文时使用。"""
+    if local_lite(cfg):
+        name = (cfg.get("assistant_name") or "Sidekick").strip()
+        return (f"You are “{name}”, a local AI assistant running on the user's tablet "
+                "(offline, and on the slow side). Answer concisely in English, get straight "
+                "to the point, no waffle. You cannot use tools right now — answer from your "
+                "existing knowledge only.")
+    env_lines = [
+        f"Working directory: {cfg['workdir']}",
+        f"OS: {'Android / Termux' if is_termux() else sys.platform}",
+        f"Python: {sys.version.split()[0]}",
+        f"shell: {termux_shell()}",
+    ]
+    if is_termux():
+        env_lines += [
+            "Important facts about this device (memorise them and avoid basic mistakes):",
+            "- This is a Termux environment on an Android device, not a regular Linux server.",
+            "- No root access. Don't try sudo / su — it will fail.",
+            "- Install software with `pkg install <name>` (not apt/yum).",
+            "- The home directory is Termux's private $HOME "
+            "(/data/data/com.termux/files/home) and won't be cleared by Android.",
+            "- To reach Android shared storage (photos, Downloads) run `termux-setup-storage` "
+            "first; afterwards the path is ~/storage/shared/.",
+            "- There is no systemd. For background daemons use nohup or termux-wake-lock, "
+            "never systemctl.",
+            "- Resources are limited: avoid high-memory jobs and page large output.",
+            "- Downloading installers/large files: use the download tool (streams to disk, "
+            "no truncation, retries on timeout), save under ~/storage/shared/Download/ and "
+            "tell the user where the file is when done.",
+            "- Installing an APK: download the .apk with download first, then run "
+            "`pm install -r <path>` via sysshell (a system-level install, no confirmation "
+            "needed). Failures are usually incompatibility or a signature issue — relay "
+            "pm's error message to the user verbatim.",
+        ]
+        env_lines += [
+            "About yourself (you can modify yourself):",
+            f"- Your own source code is {Path(__file__).resolve()}, a single-file Python "
+            "program you can inspect with read_file and change with edit_file.",
+            "- To fix your own bugs or add features, use the `selfupdate` tool (not "
+            "write_file): it auto-backs up, syntax-checks (restoring on failure), and the "
+            "service restarts with the new code; if the new code won't start, the watchdog "
+            "rolls back.",
+            "- The right way to self-update: (1) read_file the relevant code, (2) work out "
+            "the minimal change, (3) call selfupdate with patch_old/patch_new. Keep changes "
+            "small and local; avoid large rewrites.",
+            "- After a self-update the current turn ends (the service restarts). You can "
+            "verify afterwards, but if it didn't come up the user will tell you.",
+            "- Your conversation history, long-term memory and session files all survive "
+            "the restart.",
+        ]
+        if cfg.get("shell_access"):
+            env_lines += [
+                "- You can run commands via the `sysshell` tool as the shell (adb) user, "
+                "which outranks a normal app: it can read system settings, dumpsys, "
+                "getprop, pm/am and change global settings. When plain bash gets a "
+                "permission denial, switch to sysshell.",
+                "- sysshell is still not root: it can't read other apps' private data or "
+                "write system read-only partitions.",
+                "- If sysshell reports it can't reach adb: with a computer, run "
+                "`adb tcpip 5555` there; without one, enable Wireless debugging on the "
+                "tablet and pair once with `agent adbpair` — it stays paired afterwards.",
+            ]
+    mem = ""
+    if mem:
+        env_lines.append("\n[Your long-term memory of this user (accumulated during "
+                         "conversation; trust it by default unless it conflicts with new "
+                         "facts)]\n" + mem)
+    try:
+        _sk = Path(__file__).resolve().parent / "skills"
+        if _sk.is_dir():
+            _rows = []
+            for _f in sorted(_sk.glob("*.md")):
+                _t = ""
+                try:
+                    for _l in _f.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if _l.strip().startswith("#"):
+                            _t = _l.lstrip("# ").strip()
+                            break
+                except Exception:
+                    pass
+                _rows.append("- " + _f.stem + (" (" + _t + ")" if _t else ""))
+            if _rows:
+                env_lines.append(
+                    "\n[Available skills] These are distilled skill docs (pitfalls and "
+                    "correct approaches found the hard way). Read the relevant one with "
+                    "read_file before doing that kind of task (path "
+                    "~/.termux-agent/skills/<name>.md):\n"
+                    + "\n".join(_rows))
+    except Exception:
+        pass
+    try:
+        _td = {"items": []}
+        _its = []
+        if _its:
+            _rows = [("Done: " if x.get("done") else "Not done: ") + x["text"] for x in _its[:12]]
+            env_lines.append(
+                "\n[Current task list] The user's outstanding to-dos (from the local "
+                "todo.json, unaffected by conversation compression):\n"
+                + "\n".join(_rows)
+                + "\nHow to handle it: (1) check this list before taking over — don't redo "
+                  "finished items, continue the unfinished ones; (2) if an old task the user "
+                  "mentions isn't here and you can't recall it, it was compressed out of "
+                  "context — go find it with read_file/grep in ~/.termux-agent/archive/ and "
+                  "the session transcripts under sessions/; (3) never tell the user \"that "
+                  "was in another conversation\" — to them it is always the same conversation, "
+                  "and it just sounds like you're dodging.")
+    except Exception:
+        pass
+    name = (cfg.get("assistant_name") or "Sidekick").strip()
+    return (
+        f"You are “{name}”, a command-line AI assistant running locally on the user's "
+        "device, operating it for real through tools.\n\n"
+        "Rules of conduct:\n"
+        "1. When you need to know the environment (files, system state), inspect it with "
+        "tools first — never guess or ask the user to check for you.\n"
+        "2. Read a file before changing it; when unsure of a path, confirm with list_dir "
+        "or bash first.\n"
+        "3. Do exactly what the user asked — don't refactor unrelated code or install "
+        "large dependencies on your own initiative.\n"
+        "4. bash commands must be idempotent and verifiable. Explain before executing "
+        "anything destructive.\n"
+        "5. When a tool errors, read the message and fix it accordingly; don't blindly "
+        "repeat the same command.\n"
+        "6. Report briefly what you did and how it went; skip irrelevant detail.\n"
+        "7. For tasks of 3+ steps (multi-file edits, installing/configuring apps, "
+        "troubleshooting, organising material), break them into 2–6 steps with todo_write "
+        "and update the list the moment each step finishes (mark that step done=true) "
+        "rather than saving it all up; the user sees this list live above the input box. "
+        "After being stopped, disconnected or reconnected, pick up from the first "
+        "unchecked step.\n"
+        "8. You may emit several tool calls in one reply: independent read-only work "
+        "(reading several files, searching several keywords) should all go out at once — "
+        "the system runs them in parallel, much faster than one at a time (writes still "
+        "run in order).\n"
+        "9. Long tool output is never lost: the full content is written to disk and its "
+        "path given in the result. For the middle part, page through it with read_file "
+        "(negative offset reads from the end) or grep that file.\n"
+        "10. For long-running jobs of unpredictable duration (installing big packages, "
+        "long downloads, batch processing) use bash with background=true to detach them, "
+        "get the pid and log path immediately, then poll with read_file/grep — don't burn "
+        "a big timeout waiting.\n"
+        "11. Use edit_file for a single change; for several changes in one file, or "
+        "changes across files, use apply_patch once (atomic — it won't half-apply).\n"
+        "12. If edit_file says the snippet isn't unique, the error lists every occurrence "
+        "with line numbers and context — narrow it down by including a few surrounding "
+        "lines in old_string.\n"
+        "13. Reply to the user in English.\n"
+        "14. When a decision must be made by the user (spending money, deleting or "
+        "overwriting data, installing/removing apps, choosing between approaches, "
+        "information you can't obtain), use ask_user to show a choice panel — you can ask "
+        "several questions at once. For small things you can find in files/logs/the web, "
+        "or decide by common sense, don't ask: just do it and note your choice in the "
+        "report.\n\n"
+        "15. Format replies in Markdown; the UI renders it: tables, `inline code`, code "
+        "blocks, **bold**, ordered/unordered lists, blockquotes (> ), horizontal rules "
+        "(---) and links [text](https://…) are all supported. Two kinds of rich media are "
+        "also available — use them where fitting:\n"
+        "    · Cards: on its own line write `:::card Title`, then the body, then a closing "
+        "line `:::`. The first line may also be tip / warn / danger for a coloured card "
+        "that can hold lists, tables and code blocks.\n"
+        "    · HTML subset: you may write details/summary (collapsible), kbd, mark, sub, "
+        "sup, img, table, div and similar tags; tags outside the whitelist are escaped to "
+        "plain text and never executed.\n"
+        "    · Inline SVG: a whole <svg>…</svg> block works (rect, circle, path, text, "
+        "linearGradient, stop etc.), and camelCase attributes such as viewBox / "
+        "linearGradient are preserved — good for layout diagrams, schematics and simple "
+        "shapes.\n"
+        "    Keep simple questions to one sentence; don't pad them with cards and tables "
+        "just for looks.\n\n"
+        "Current environment:\n" + "\n".join(env_lines)
     )
 
 
@@ -2979,6 +3157,27 @@ SELFCHECK_SYSTEM = (
     "不确定的地方要明说不确定，不要编造。"
 )
 
+SELFCHECK_SYSTEM_EN = (
+    "You are the ops diagnostician for this on-device assistant. The user gives you a "
+    "program log; analyse it as follows:\n"
+    "1. [What happened] Summarise the main activity during this log in one or two sentences;\n"
+    "2. [Anomalies] List each error/warning/abnormal behaviour with an approximate "
+    "timestamp and the key raw snippet; if there really are none, state plainly "
+    "\"no anomalies found\";\n"
+    "3. [Likely cause] Give the most probable cause for each anomaly;\n"
+    "4. [Suggested action] Give concrete, runnable next steps (which file to edit, which "
+    "command to run, what to check).\n"
+    "Requirements: English, concise, conclusion first; don't parrot the log; no "
+    "pleasantries; say plainly when you're unsure instead of making things up."
+)
+
+
+def selfcheck_system() -> str:
+    """自检提示词按界面语言选择。"""
+    if str(globals().get("UI_LANG") or "zh").lower().startswith("en"):
+        return SELFCHECK_SYSTEM_EN
+    return SELFCHECK_SYSTEM
+
 
 def ai_selfcheck(cfg: dict, name: str, tail: int = 300) -> dict:
     """让接入的模型读日志尾部并给出诊断。失败时返回 ok=False ＋ 原因。"""
@@ -2992,7 +3191,7 @@ def ai_selfcheck(cfg: dict, name: str, tail: int = 300) -> dict:
         text = text[-60000:]
     try:
         answer = _chat_once(cfg, [
-            {"role": "system", "content": SELFCHECK_SYSTEM},
+            {"role": "system", "content": selfcheck_system()},
             {"role": "user", "content": "日志文件：" + r["name"]
              + "（共 " + str(r["size"]) + " 字节，以下是末尾 " + str(len(r["lines"])) + " 行）\n\n" + text},
         ], 1500)
@@ -3504,7 +3703,7 @@ def send_notify(cfg, title, content, tag="termux_agent", url="", throttle=0) -> 
             if now - _NOTIFY_SEEN.get(tag, 0.0) < throttle:
                 return
             _NOTIFY_SEEN[tag] = now
-        title = re.sub(r"\s+", " ", str(title or "Sidekick")).strip()[:50]
+        title = re.sub(r"\s+", " ", str(title or "皮卡丘")).strip()[:50]
         content = re.sub(r"\s+", " ", str(content or "")).strip()[:250] or "（无详情）"
 
         if not notify_api_ready():
@@ -3605,15 +3804,32 @@ def tool_ask_user(cfg, questions=None, timeout_sec: int = 900) -> str:
     answers = item.get("answers")
     ws_broadcast({"ev": "ask_done", "d": {"id": aid}})
     if answers is None:
-        return ("[提示] 用户没有作答（可能走开了，或点了停止）。"
+        _en = str(globals().get("UI_LANG") or "zh").lower().startswith("en")
+        return ("[Note] The user did not answer (they may have walked away, or hit stop). "
+                "Continue with the safest option according to your own judgement; if you "
+                "truly cannot decide, stop and wait for them — don't guess."
+                if _en else
+                "[提示] 用户没有作答（可能走开了，或点了停止）。"
                 "先按你判断里最稳妥的方案继续；实在不能决定就停下来等他，别自己硬猜。")
+    _en = str(globals().get("UI_LANG") or "zh").lower().startswith("en")
     lines = []
     for i, q in enumerate(qs):
         a = answers[i] if i < len(answers) else ""
         if isinstance(a, list):
-            a = "、".join(str(x) for x in a)
-        lines.append("%d. %s\n   → %s" % (i + 1, q["question"], a or "（未选）"))
-    return "用户的选择：\n" + "\n".join(lines)
+            a = (", " if _en else "、").join(str(x) for x in a)
+        lines.append("%d. %s\n   → %s" % (i + 1, q["question"],
+                                          a or ("(none selected)" if _en else "（未选）")))
+    return ("User's choices:\n" if _en else "用户的选择：\n") + "\n".join(lines)
+
+
+def subagent_system() -> str:
+    """子代理的系统提示：按界面语言选。"""
+    if str(globals().get("UI_LANG") or "zh").lower().startswith("en"):
+        return ("You are the sub-agent of the main AI assistant. Focus on the single "
+                "sub-task you were given and output only the conclusion itself — do not "
+                "explain your process, make small talk, or ask questions.")
+    return ("你是主 AI 助手的子代理。专注完成分配给你的这一个子任务，"
+            "只输出结论本身，不要解释过程、不要寒暄、不要提问。")
 
 
 def tool_subagent(cfg, prompt: str, max_tokens: int = 2000) -> str:
@@ -3621,8 +3837,7 @@ def tool_subagent(cfg, prompt: str, max_tokens: int = 2000) -> str:
     if not prompt or not prompt.strip():
         return "[错误] prompt 不能为空"
     msgs = [
-        {"role": "system", "content": "你是主 AI 助手的子代理。专注完成分配给你的这一个子任务，"
-                                      "只输出结论本身，不要解释过程、不要寒暄、不要提问。"},
+        {"role": "system", "content": subagent_system()},
         {"role": "user", "content": prompt},
     ]
     try:
@@ -3674,7 +3889,7 @@ def _adb_candidates() -> list:
     #   · 缓存不能用「空列表 = 没扫过」来判断 —— 扫不到时 ports 是 []，假值，
     #     于是每轮重扫（实测第二次调用仍要 14.3 秒）。改用独立时间戳。
     #   · 不能只探 127.0.0.1：无线调试的 adbd 常只绑在 WiFi 网卡上
-    #     （adb devices 里会显示 192.168.x.x:xxxxx 这类地址），回环扫不到。
+    #     （adb devices 里 192.168.x.x:xxxxx 就是证据），回环扫不到。
     #   · 逐个 connect_ex 太慢（35536 个端口 14 秒），改成非阻塞 connect +
     #     select 批量等待，快一个数量级。
     _now = time.time()
@@ -4568,6 +4783,264 @@ TOOL_SCHEMAS = [
 ]
 
 
+# 工具的英文说明覆盖表：界面语言为英文时，用它替换 TOOL_SCHEMAS 里的
+# description 与参数说明（结构、参数名、required 一律不变，只换文字）。
+# 未列出的键沿用中文原值。
+TOOL_DESC_EN = {
+    "hdcmate": {
+        "desc": ("Remote-control a paired Huawei phone (HarmonyOS, over the HDC protocol, "
+                 "not adb). The full skill doc is ~/.termux-agent/hdc_skill.md (protocol "
+                 "notes, common HarmonyOS commands, UI automation, pitfalls) — read it "
+                 "first when you need details. action=exec runs a shell command on the "
+                 "phone (the command goes in value); action=target sets and remembers the "
+                 "phone address (host + port, once only); action=test checks the connection. "
+                 "On first use you must run action=target to set the address; get it from "
+                 "the phone's Settings → System & updates → Developer options → Wireless "
+                 "debugging under “IP address and port”. Note: the port changes after the "
+                 "phone reboots or the router changes, so re-target then. Permissions match "
+                 "adb shell (uid 2000): no reading app-private data, no root. Common "
+                 "commands: bm dump -a -l lists apps; aa start -b <bundle> -a EntryAbility "
+                 "launches an app; uitest dumpLayout -p /data/local/tmp/lay.json exports the "
+                 "UI layout; uitest uiInput click X Y taps coordinates (full UI automation)."),
+        "props": {
+            "action": "exec / target / test, defaults to exec",
+            "value": "the shell command to run when action=exec",
+            "host": "phone IP, only for action=target",
+            "port": "wireless debugging port, only for action=target",
+            "timeout": "timeout in seconds, default 40",
+        }},
+    "wx_auto": {
+        "desc": ("Automated WeChat companion: read WeChat messages / auto-reply to a "
+                 "chosen contact (the user authorised this, and the other party knows). action=read "
+                 "only reads the screen (multimodal vision) and never sends; once runs a "
+                 "check-up: three gates whose verdicts are shown to a human; run starts "
+                 "auto-reply in the background (replies only to new incoming messages, and "
+                 "never twice to the same one); stop stops it; status shows state and logs. "
+                 "Reading the screen relies on a multimodal model looking at screenshots, so "
+                 "the WeChat chat window must be visible on screen. Safety limits: uncertain "
+                 "recognition or system words are only logged, a missing send button means "
+                 "give up, and the cap is 20 messages per hour."),
+        "props": {"action": "read / once / run / stop / status"}},
+    "bash": {
+        "desc": ("Run a shell command on this device and return the output. This is the "
+                 "workhorse: use it to inspect system state, run programs, install pkg "
+                 "packages, manage files and so on. Prefer it for anything terminal-like."),
+        "props": {
+            "command": "the full command to run",
+            "timeout_sec": "timeout in seconds, default 120, max 900",
+            "background": ("true = run long in the background: returns the pid and log path "
+                           "immediately without blocking. Use it for big installs, long "
+                           "downloads, batch processing — then poll the log with "
+                           "read_file/grep. Default false (wait for the command to finish)."),
+        }},
+    "read_file": {
+        "desc": ("Read a text file with line numbers. For large files page through it with "
+                 "offset/limit; a negative offset counts back from the end (e.g. -50 = last "
+                 "50 lines), handy for the tail of a log."),
+        "props": {
+            "path": "file path; a relative path is resolved against the working directory",
+            "offset": "first line number, 1-based, default 1; negative counts from the end",
+            "limit": "how many lines to read, default 800, max 2000 per call",
+        }},
+    "write_file": {
+        "desc": ("Write a file (overwrites the whole file, creates it if missing, and "
+                 "creates parent directories automatically). To change an existing file, "
+                 "prefer edit_file."),
+        "props": {"content": "the complete file content"},
+    },
+    "apply_patch": {
+        "desc": ("Apply a patch touching several places/files at once (unified-diff style). "
+                 "Multiple files take effect atomically: everything must match or nothing is "
+                 "written. Prefer it for multi-site edits and cross-file changes — fewer "
+                 "round-trips and safer than repeated edit_file. Format:\n"
+                 "*** Update File: path\n@@\n context line\n-line to remove\n+line to add\n"
+                 "(For a new file use *** Add File: path, to delete use *** Delete File: "
+                 "path; the standard --- a/x +++ b/x form also works.)"),
+        "props": {"patch": "the full patch text (may contain several files and @@ hunks)"},
+    },
+    "edit_file": {
+        "desc": ("Do an exact string replacement in a file. old_string must match the "
+                 "original exactly (including indentation) and must be unique by default. "
+                 "The preferred tool for editing an existing file."),
+        "props": {
+            "path": "file path",
+            "old_string": "the snippet to replace; include enough context to make it unique",
+            "new_string": "the replacement; an empty string deletes the snippet",
+            "replace_all": "replace every match, default false",
+        }},
+    "list_dir": {
+        "desc": ("List a directory with type, size and modification time. Use it to "
+                 "understand project structure and locate files."),
+        "props": {
+            "path": "directory path, defaults to the working directory",
+            "pattern": "optional regex filtering by file name",
+        }},
+    "grep": {
+        "desc": ("Recursively search text content in a directory (regex supported), "
+                 "returning file:line: content. Use it to find code; don't shell out to grep."),
+        "props": {
+            "pattern": "regular expression",
+            "path": "root path to search, defaults to the working directory",
+            "include": "only search files whose name matches this regex, e.g. \\.py$",
+            "max_results": "max number of matches, default 200",
+        }},
+    "fetch_url": {
+        "desc": ("Fetch a web page or API response and convert it to plain text, for "
+                 "research, docs and API output. Text only — don't use it to download large "
+                 "files."),
+        "props": {
+            "url": "the full URL",
+            "max_chars": "max characters to return, default 20000",
+        }},
+    "download": {
+        "desc": ("Stream a file to local disk (no truncation, with timeouts), for large "
+                 "files such as APKs, installers and images. Use it for app installers like "
+                 "WeChat — not fetch_url or curl."),
+        "props": {
+            "url": "download URL",
+            "path": "save path, e.g. ~/storage/shared/Download/wechat.apk",
+            "timeout_sec": "timeout in seconds, default 600",
+        }},
+    "web_search": {
+        "desc": ("Web search (no key needed). Use it when you need current information, to "
+                 "look things up or verify facts, instead of answering from memory."),
+        "props": {
+            "query": "search keywords",
+            "max_results": "max results, default 8, max 15",
+        }},
+    "github": {
+        "desc": ("Operate GitHub repos (read/write your own repos; a token must be "
+                 "configured). clone/pull brings a repo down locally, push commits and "
+                 "pushes after you edit. action: list repos / repo details / read a file / "
+                 "tree a directory / clone / pull / push commit+push / create / search code."),
+        "props": {
+            "action": "list/repo/read/tree/clone/pull/push/create/search",
+            "repo": "owner/name; for create just the repo name",
+            "path": "file path relative to the repo, for read/tree/push",
+            "ref": "branch or commit, defaults to the repo's default branch",
+            "content": "file content to write on push (with path)",
+            "files": "batch write on push: {relative path: content}",
+            "message": "commit message / repo description",
+            "dir": "local directory, default ~/github/<repo name>",
+            "branch": "target branch to push to; empty uses the repo default",
+            "query": "search term for search",
+            "private": "whether create makes it private, default true",
+        }},
+    "todo_write": {
+        "desc": ("Maintain the task list: break a 3+ step task into 2–6 steps and put them "
+                 "here; the moment one finishes, call it again with that step done=true "
+                 "(don't save it up). The list shows live above the user's input box with "
+                 "openable progress; after an interruption or reconnect, continue from the "
+                 "unchecked steps."),
+        "props": {"items": "the task list"},
+    },
+    "subagent": {
+        "desc": ("Hand an independent sub-problem to a focused “sub-agent” to think about "
+                 "on its own (it has no access to this machine's files) and return its "
+                 "conclusion. Good for splitting up complex tasks and pushing several hard "
+                 "parts forward in parallel."),
+        "props": {
+            "prompt": "the task for the sub-agent; state the goal and the expected output",
+            "max_tokens": "output cap, default 2000",
+        }},
+    "sysshell": {
+        "desc": ("Run a command as the shell (adb) user, which outranks a normal app: can "
+                 "read system settings, dumpsys, getprop, pm/am and change global settings. "
+                 "When plain bash hits a permission denial, use this instead. Not root."),
+        "props": {
+            "command": "the command to run",
+            "timeout_sec": "timeout in seconds, default 60",
+        }},
+    "selfupdate": {
+        "desc": ("Modify your own source code (~/.termux-agent/agent.py) to fix your own "
+                 "bugs or add features. It auto-backs up and syntax-checks, restoring "
+                 "immediately on failure; on success the service restarts with the new code, "
+                 "and the watchdog rolls back if it won't start. Note: read the source with "
+                 "read_file before calling, and keep the change small and precise; the turn "
+                 "ends after this call."),
+        "props": {
+            "summary": "one line describing what you changed",
+            "new_code": ("the entire new source (either this or patch_old; the file is huge, "
+                         "so prefer the patch form)"),
+            "patch_old": "the original snippet to replace (must match the source exactly and be unique)",
+            "patch_new": "the replacement content",
+        }},
+    "ask_user": {
+        "desc": ("Ask the user a question and let them pick from your options (a choice "
+                 "panel pops up and waits, several questions at once allowed). Use it only "
+                 "when a decision must be made by the user: spending money, deleting or "
+                 "overwriting data, installing/removing apps, choosing between approaches, "
+                 "or information you can't obtain (passwords, preferences, real intent). "
+                 "Small things you can find in files/logs/the web or settle by common sense "
+                 "(a name, which step first, whether to retry) — just do them and note your "
+                 "choice in the report."),
+        "props": {
+            "questions": "1–6 questions",
+            "timeout_sec": "how long before it times out, default 900 seconds",
+        }},
+    "wps": {
+        "desc": ("Create/edit WPS (Word/Excel/PPT) documents via a local MCP service, no "
+                 "account login needed. action=list first shows the available tools "
+                 "(default); with action=call, use tool to name the tool and args to pass "
+                 "JSON-string arguments, e.g. tool=create_spreadsheet "
+                 "args={\"filename\":\"table.xlsx\"}. Files land in ~/storage/shared/WPS_AI/; "
+                 "open them with WPS on the phone."),
+        "props": {
+            "action": "list (default, list tools) / call (invoke) / ping",
+            "tool": "tool name for action=call, e.g. create_document",
+            "args": "arguments for action=call, as a JSON string",
+        }},
+    "imgedit": {
+        "desc": ("Run AI processing on an image, five operations:\n"
+                 "erase=remove text/watermarks; restore=repair old photos; enhance=improve "
+                 "quality; beauty=portrait retouching; matting=cut out the background.\n"
+                 "image takes a local path or an http(s) URL (local images under 4MB).\n"
+                 "Processed asynchronously, usually in about ten seconds; the result is "
+                 "downloaded locally and its path returned.\n"
+                 "Note: this consumes account credit (about 0.6 per image) — don't spam it."),
+        "props": {
+            "operation": "erase / restore / enhance / beauty / matting",
+            "image": "local image path or http(s) image URL",
+            "prompt": "optional: extra instructions, supported by some operations",
+            "out": "optional: output path or directory, default ~/.termux-agent/outputs/",
+            "timeout_sec": "optional: max wait in seconds, default 300",
+        }},
+}
+
+
+def localize_tools(tools: list, lang: str | None = None) -> list:
+    """按界面语言本地化工具定义：只替换 description 与参数说明文字，
+    工具名、参数名、类型、required 一律不动。英文以外的语言原样返回。"""
+    lc = str(lang or globals().get("UI_LANG") or "zh").lower()
+    if not lc.startswith("en"):
+        return tools
+    out = []
+    for t in tools:
+        fn = t.get("function") or {}
+        name = fn.get("name") or ""
+        ov = TOOL_DESC_EN.get(name)
+        if not ov:
+            out.append(t)
+            continue
+        nf = dict(fn)
+        if ov.get("desc"):
+            nf["description"] = ov["desc"]
+        props = ov.get("props") or {}
+        if props:
+            pa = dict(nf.get("parameters") or {})
+            pr = dict(pa.get("properties") or {})
+            for pk, pv in pr.items():
+                if pk in props:
+                    pr[pk] = dict(pv)
+                    pr[pk]["description"] = props[pk]
+            pa["properties"] = pr
+            nf["parameters"] = pa
+        nt = dict(t)
+        nt["function"] = nf
+        out.append(nt)
+    return out
+
+
 # 工具的中文名与摘要 —— 界面只给人看这些，不暴露原始命令
 
 TOOL_LABELS = {
@@ -4849,7 +5322,7 @@ def build_tools(cfg: dict):
         if nm in off:
             continue
         out.append(t)
-    return out
+    return localize_tools(out)
 
 
 def _tool_detail(name: str, args: dict) -> str:
@@ -6167,6 +6640,573 @@ def _one_line(s: str, n: int = 100) -> str:
     return (s[:n] + "…") if len(s) > n else s
 
 
+# ---------------------------------------------------------------- 多语言（i18n）
+# 界面文案字典：键名区域_语义。t() 取词，缺失自动回落中文。
+# 加语言 = 往 I18N_BUILD 里加一个语言码的字典，不必改其它代码。
+
+I18N_BUILD = {
+    # ============ 语言元信息 ============
+    "meta": {
+        "zh":    {"name": "简体中文", "native": "简体中文", "dir": "ltr"},
+        "en":    {"name": "English", "native": "English", "dir": "ltr"},
+    },
+
+    # ============ 第一批：约 90 条高频文案 ============
+    # 键名规则：区域_语义，如 chat_send / cfg_model / evo_done
+    "zh": {
+        # --- 顶栏 / 导航 ---
+        "nav_back": "‹  返回",
+        "nav_settings": "设置",
+        "nav_console": "控制台",
+        "nav_close": "关闭",
+        "nav_help": "查看说明",
+        "nav_updates": "查看更新记录",
+        "nav_expand_list": "展开对话列表",
+        "nav_collapse": "收起侧栏（双击分界线也能切换）",
+        "nav_resize": "拖动调整宽度 · 双击收起/展开",
+        "nav_lang": "语言",
+
+        # --- 输入区 ---
+        "in_placeholder": "说点什么…",
+        "in_send": "发送",
+        "in_stop": "停止",
+        "in_stopping": "停止中…",
+        "in_attach": "发送图片或文件",
+        "in_hint_full": "Enter 发送 · Shift+Enter 换行 · ↑↓ 翻历史 · Esc 中断 · @ 引用文件 · Ctrl+F 搜索 · / 看命令",
+
+        # --- 对话 ---
+        "chat_thinking": "思考中…",
+        "chat_thoughts": "思考过程",
+        "chat_assistant": "助手",
+        "chat_copy_msg": "复制这条消息",
+        "chat_copy_reply": "复制这条回答",
+        "chat_continue": "继续",
+        "chat_find": "在对话里搜索（Ctrl+F）",
+        "chat_find_ph": "在对话里搜索…",
+        "chat_find_prev": "上一个（Shift+Enter）",
+        "chat_find_next": "下一个（Enter）",
+        "chat_find_close": "关闭（Esc）",
+        "chat_to_latest": "↓ 回到最新",
+        "chat_done_goto": "任务已完成，点这里回到最新",
+        "chat_empty_reply": "没有返回内容",
+        "chat_interrupted": "已中断",
+
+        # --- 最近对话 ---
+        "sess_recent": "最近对话",
+        "sess_pin": "置顶",
+        "sess_unpin": "取消置顶",
+        "sess_pin_tip": "置顶后会排在最前面，并用金色高亮",
+        "sess_rename": "改名",
+        "sess_rename_tip": "给这个对话起个名字（留空则恢复自动标题）",
+        "sess_new": "开一个新对话",
+        "sess_archive": "归档",
+        "sess_archive_tip": "压缩上下文后归档保存（不会丢，可恢复）",
+        "sess_delete": "删除（不可恢复，建议先归档）",
+        "sess_restore": "恢复",
+        "sess_restore_tip": "放回「最近对话」，可以接着聊",
+
+        # --- 待发送队列 ---
+        "q_title": "待发送",
+        "q_clear": "清空",
+        "q_jump": "插队",
+        "q_jump_tip": "不中断当前任务，把这条插进当前任务里",
+        "q_no_task": "当前没有在跑的任务，直接发就行",
+        "q_jumped": "已插队，任务不会中断",
+        "q_remove": "移除",
+
+        # --- 文件 / 图片 ---
+        "file_remove": "移除",
+        "file_remove_img": "移除图片",
+        "file_too_big": "文件太大（上限 30MB）",
+        "file_too_big_img": "非图片文件上限 8MB",
+        "file_pick_fail": "读取文件失败",
+        "file_pick_fail_img": "读取图片失败",
+        "file_uploading": "正在上传图片…",
+        "file_upload_fail": "图片上传失败",
+
+        # --- 上下文 ---
+        "ctx_used": "已用 ≈",
+        "ctx_compress_at": "% 时压缩）",
+        "ctx_ring0": "上下文 0 / 0 token · 0%",
+
+        # --- 设置：模型 ---
+        "cfg_brand": "品牌",
+        "cfg_base_url": "接口地址",
+        "cfg_model": "模型",
+        "cfg_balance": "余额",
+        "cfg_balance_tip": "点「查询」看剩余额度",
+        "cfg_query": "正在查询…",
+        "cfg_query_fail": "查询失败",
+        "cfg_no_balance_api": "该服务商未提供余额接口",
+        "cfg_pulling": "正在拉取模型…",
+        "cfg_pull_fail": "拉取失败：",
+        "cfg_custom": "自定义…",
+        "cfg_local_offline": "本地模型（离线可用）",
+        "cfg_local_stopped": "本地模型（服务未启动）",
+        "cfg_no_result": "无结果",
+        "cfg_saved": "已保存",
+        "cfg_key": "API Key",
+        "cfg_key_ph": "sk-…（留空则不变）",
+        "cfg_base_ph": "https://api.deepseek.com/v1",
+        "cfg_shell": "增强权限",
+        "cfg_shell_note": "以 shell（adb）身份执行命令，可读系统设置、dumpsys、pm/am。不是 root。",
+        "cfg_pull": "拉取",
+        "cfg_query_btn": "查询",
+        "cfg_save": "保存",
+        "cfg_note1": "选好「品牌」，接口地址会自动填上，不必手打。",
+        "cfg_note2": "预设覆盖 DeepSeek、智谱、通义等常见品牌，选中即自动填接口地址。用自建或代理服务时选「自定义」，自己填地址。",
+        "cfg_note3": "各品牌的 API Key 分开记住：换品牌不会丢、也不会互相覆盖。要改哪个品牌，选中它、重新输入一次即可。",
+        "cfg_note4": "Key 存在本机 config.json 里，只用于向对应接口发请求；这个界面只监听 127.0.0.1，不对局域网开放。",
+        "cfg_note5": "填好 Key 后点「拉取」获取该接口的可用模型；点「查询」看余额或积分。",
+        "cfg_note6": "「拉取」拿到的是接口当前真实提供的模型列表，所以新模型上线不用等更新，拉一次就有。",
+        "cfg_local_suffix": "（本地）",
+        "cfg_local_online_a": "本地模型在线：",
+        "cfg_local_online_b": "，选中会自动指向 ",
+        "cfg_lang_untranslated": "  (未翻译)",
+        "cfg_key_stored_a": "该品牌已存 Key：",
+        "cfg_key_stored_b": "，留空即保持不变",
+        "cfg_key_none": "该品牌还没存过 Key，填一次即记住",
+        "cfg_need_base": "先填接口地址（或选一个品牌）",
+        "cfg_fetched_n": " 个模型，选中后点「保存」生效",
+        "cfg_balance_money_a": "（充值 ",
+        "cfg_balance_money_b": " + 赠送 ",
+        "cfg_balance_money_c": "）",
+        "cfg_unknown": "未知原因",
+
+        # --- 进化 ---
+        "evo_auto": "自动进化",
+        "evo_direction": "进化方向",
+        "evo_daily": "每天",
+        "evo_run_now": "立即进化一次",
+        "evo_on": "· 已开启",
+        "evo_off": "· 已关闭",
+        "evo_today": "今日",
+        "evo_done": "进化完成：",
+        "evo_pick_one": "点一次才出来",
+        "evo_locked": "已锁定",
+        "evo_unlocked": "未锁定 · AI 每天自动换一批",
+
+        # --- 更新记录 ---
+        "upd_title": "更新记录",
+        "upd_desc": "每次自我更新 / 自动进化 / 手动进化都留一条：版本号 · 时间 · 改了什么。",
+        "upd_empty": "还没有记录。自我更新或进化后会显示在这里。",
+
+        # --- 记忆 ---
+        "mem_title": "记忆",
+        "mem_long": "长期记忆",
+        "mem_empty": "还没有积累记忆。多聊几句，它会自动提炼。",
+
+        # --- 任务清单 ---
+        "todo_title": "任务清单",
+        "todo_clear": "清空清单",
+
+        # --- 工具 / 技能 ---
+        "tool_need_pick": "需要你拍板",
+        "tool_switched": "已切换到",
+
+        # --- 通用 ---
+        "ok_copied": "已复制",
+        "ok_saved": "已保存",
+        "err_copy_fail": "复制失败，请长按消息手动选择",
+        "err_generic": "出错了：",
+        "log_pick_a": "这是我从控制台「运行日志」里选的 ",
+        "log_pick_b": " 的末尾内容，请先判断有没有问题，能直接修的就动手修，修不了说明原因：\n\n",
+        "evo_dir_help": "点一颗胶囊即锁定该方向（再点一下取消），可同时锁定多个；不锁定就每天由 AI 自动换一批。自动进化与手动进化都优先按锁定的方向做。「每天几项」是自动进化每天最多做几项，手动点的不占额度。<br>每项改动都会自动备份 + 语法检查，失败立即还原；服务由看门狗托管，起不来会自动回滚。",
+        "look_reset": "恢复默认",
+        "chat_more_steps": "点击展开 / 收起更早的步骤",
+        "queue_inject_title": "不中断当前任务，把这条插进当前任务里",
+        "queue_remove": "移除",
+        "file": "文件",
+        "file_no_preview": "浏览器无法预览，由服务端转换",
+        "img_remove": "移除图片",
+        "chat_done_title": "任务已完成，点这里回到最新",
+        "skill_gen_fail": "生成失败：",
+        "chat_slow": "响应较慢…若平板刚拔掉电源线，可能被系统省电冻结了",
+        "look_preset": "预设",
+        "evo_ai_picking": "正在让 AI 研究今天的方向…",
+        "slash_hint": "↑↓ 选择 · Enter 执行 · Tab 补全 · Esc 关闭",
+        "at_hint": "@ 引用文件 · ↑↓ 选择 · Enter 插入 · Esc 关闭",
+        "sess_no_match_a": "没有匹配「",
+        "sess_no_match_b": "」的对话",
+        "evo_per": "每天",
+        "evo_items": "项",
+        "evo_today_prefix": "今日 ",
+        "cfg_no_models": "这个后端没有 /models 接口，列出的是内置清单（",
+        "cfg_no_models_mid": " 个），仅供参考",
+        "cfg_balance": "余额",
+        "cfg_used_local": "本机累计消耗",
+        "cfg_points": "点",
+        "log_ai_check": "【AI 自检：",
+        "log_ai_fail": "自检失败：",
+        "log_send_ai": "发给 AI 解决",
+        "log_ai_analyzing": "AI 正在分析…",
+        "sess_none": "还没有对话",
+        "chat_you_inject": "你（插队）",
+        "evo_auto": "自动进化",
+        "evo_dir": "进化方向",
+        "evo_btn_now": "立即进化一次",
+        "log_none": "(没有日志文件)",
+        "log_selected": "已选 ",
+        "chat_back_latest": "↓ 回到最新",
+        "chat_thinking": "思考过程",
+        "queue_pending": "待发送 ",
+        "queue_clear": "清空",
+        "queue_inject": "插队",
+        "chat_interrupted": "已中断",
+        "chat_no_content": "没有返回内容",
+        "sess_archived_note": "点归档项可看摘要；原文完整保存在 archive/ 目录里。",
+        "log_none_yet": "还没有记录。自我更新或进化后会显示在这里。",
+        "cfg_fetching_models": "正在拉取模型…",
+        "cfg_querying": "正在查询…",
+        "cfg_fetch_fail": "拉取失败：",
+        "cfg_fetched": "已拉到 ",
+        "evo_dir_hint": "每天由 AI 自动换一批；点一颗即可锁定它",
+        "cfg_custom_note": "自定义接口：Key 按接口地址单独记",
+        "chat_copied": "已复制",
+        "chat_copy_fail": "复制失败，请长按消息手动选择",
+        "chat_copy_stale": "这段代码已经不在缓存里了",
+        "chat_copy": "复制",
+        "ctx_compress_at_prefix": "（",
+        "ctx_at_static": "% 时压缩",
+        "sess_search_ph": "搜索对话…",
+        "sess_empty": "（空）",
+        "cfg_local_none": "未检测到 · 先执行 local-model.sh start",
+        "find_none": "无结果",
+        "chat_search": "搜索",
+        "in_stop": "停止",
+        "in_stopping": "停止中…",
+        "in_hint_queue": "回车排队，这条会在当前任务结束后自动发出 · Esc 中断",
+        "in_hint_stop": "Esc 中断当前任务",
+        "cfg_name": "名称",
+        "cfg_name_ph": "给这个助手起个名字",
+        "evo_daily": "每天自动进化",
+        "evo_dir": "进化方向",
+        "evo_perday": "每天几项",
+        "evo_today": "今日进度",
+        "evo_manual": "手动进化",
+        "evo_btn_now": "立即进化一次",
+        "cfg_changelog": "更新记录",
+        "cfg_memory": "记忆",
+        "cfg_memory_long": "长期记忆",
+        "cfg_ctx": "上下文",
+        "cfg_ctx_use": "占用",
+        "cfg_compact": "压缩时机",
+        "cfg_tools": "工具",
+        "cfg_all": "全选",
+        "th_skill": "技能",
+        "th_desc": "说明",
+        "th_size": "大小",
+        "th_made": "建立",
+        "th_tool": "工具",
+        "th_use": "用途",
+        "sess_new_btn": "新对话",
+        "ctl_identity": "身份",
+        "evo_sec": "进化",
+        "ctl_look": "外观",
+        "ctl_log": "日志",
+        "ctl_skill": "技能",
+        "hello_h1": "有什么可以帮你？",
+        "hello_p": "它在本机运行，可以看文件、跑命令、整理资料",
+        "reload_for_lang": "正在切换语言，页面将重新加载…",
+    },
+
+    "en": {
+        # --- top bar / nav ---
+        "nav_back": "‹  Back",
+        "nav_settings": "Settings",
+        "nav_console": "Console",
+        "nav_close": "Close",
+        "nav_help": "Help",
+        "nav_updates": "Release notes",
+        "nav_expand_list": "Show conversations",
+        "nav_collapse": "Collapse sidebar (or double-tap the divider)",
+        "nav_resize": "Drag to resize · double-tap to collapse",
+        "nav_lang": "Language",
+
+        # --- input ---
+        "in_placeholder": "Type a message…",
+        "in_send": "Send",
+        "in_stop": "Stop",
+        "in_stopping": "Stopping…",
+        "in_attach": "Send image or file",
+        "in_hint_full": "Enter to send · Shift+Enter for newline · ↑↓ history · Esc to interrupt · @ to reference files · Ctrl+F to search · / for commands",
+
+        # --- chat ---
+        "chat_thinking": "Thinking…",
+        "chat_thoughts": "Reasoning",
+        "chat_assistant": "Assistant",
+        "chat_copy_msg": "Copy this message",
+        "chat_copy_reply": "Copy this reply",
+        "chat_continue": "Continue",
+        "chat_find": "Search in conversation (Ctrl+F)",
+        "chat_find_ph": "Search in conversation…",
+        "chat_find_prev": "Previous (Shift+Enter)",
+        "chat_find_next": "Next (Enter)",
+        "chat_find_close": "Close (Esc)",
+        "chat_to_latest": "↓ Jump to latest",
+        "chat_done_goto": "Task finished — tap to jump to latest",
+        "chat_empty_reply": "No content returned",
+        "chat_interrupted": "Interrupted",
+
+        # --- recent conversations ---
+        "sess_recent": "Recent",
+        "sess_pin": "Pin",
+        "sess_unpin": "Unpin",
+        "sess_pin_tip": "Pinned conversations stay on top, highlighted in gold",
+        "sess_rename": "Rename",
+        "sess_rename_tip": "Name this conversation (leave blank to restore auto title)",
+        "sess_new": "New conversation",
+        "sess_archive": "Archive",
+        "sess_archive_tip": "Compress context and archive — nothing is lost, you can restore it",
+        "sess_delete": "Delete (permanent — consider archiving first)",
+        "sess_restore": "Restore",
+        "sess_restore_tip": "Put it back into Recent so you can continue",
+
+        # --- pending queue ---
+        "q_title": "Queued",
+        "q_clear": "Clear",
+        "q_jump": "Jump queue",
+        "q_jump_tip": "Insert this into the current task without interrupting it",
+        "q_no_task": "No task running — just send it",
+        "q_jumped": "Queued ahead — the task won't be interrupted",
+        "q_remove": "Remove",
+
+        # --- files / images ---
+        "file_remove": "Remove",
+        "file_remove_img": "Remove image",
+        "file_too_big": "File too large (30MB max)",
+        "file_too_big_img": "Non-image files are limited to 8MB",
+        "file_pick_fail": "Failed to read file",
+        "file_pick_fail_img": "Failed to read image",
+        "file_uploading": "Uploading image…",
+        "file_upload_fail": "Image upload failed",
+
+        # --- context ---
+        "ctx_used": "Used ≈",
+        "ctx_compress_at": "% to compress)",
+        "ctx_ring0": "Context 0 / 0 tokens · 0%",
+
+        # --- settings: model ---
+        "cfg_brand": "Provider",
+        "cfg_base_url": "API endpoint",
+        "cfg_model": "Model",
+        "cfg_balance": "Balance",
+        "cfg_balance_tip": "Click Query to check your remaining quota",
+        "cfg_query": "Querying…",
+        "cfg_query_fail": "Query failed",
+        "cfg_no_balance_api": "This provider has no balance API",
+        "cfg_pulling": "Fetching models…",
+        "cfg_pull_fail": "Fetch failed: ",
+        "cfg_custom": "Custom…",
+        "cfg_local_offline": "Local model (works offline)",
+        "cfg_local_stopped": "Local model (service not running)",
+        "cfg_no_result": "No results",
+        "cfg_saved": "Saved",
+        "cfg_key": "API Key",
+        "cfg_key_ph": "sk-… (leave blank to keep)",
+        "cfg_base_ph": "https://api.deepseek.com/v1",
+        "cfg_shell": "Shell access",
+        "cfg_shell_note": "Run commands as the shell (adb) user: can read system settings, dumpsys, pm/am. Not root.",
+        "cfg_pull": "Fetch",
+        "cfg_query_btn": "Query",
+        "cfg_save": "Save",
+        "cfg_note1": "Pick a provider and the endpoint is filled in automatically — no need to type it.",
+        "cfg_note2": "Presets cover DeepSeek, Zhipu, Qwen and other common providers; selecting one auto-fills the endpoint. For self-hosted or proxy services, pick “Custom” and enter the address yourself.",
+        "cfg_note3": "API keys are remembered per provider: switching providers loses nothing and nothing overwrites another. To change a provider's key, select it and re-enter.",
+        "cfg_note4": "Keys live in config.json on this device and are only used to call the matching endpoint; this UI listens on 127.0.0.1 only, never exposed to the LAN.",
+        "cfg_note5": "After entering a key, click Fetch to list that endpoint's models; click Query to check balance or credits.",
+        "cfg_note6": "Fetch returns the model list the endpoint actually serves right now, so new models show up without waiting for an update.",
+        "cfg_local_suffix": " (local)",
+        "cfg_local_online_a": "Local models online: ",
+        "cfg_local_online_b": ", selecting one points to ",
+        "cfg_lang_untranslated": "  (untranslated)",
+        "cfg_key_stored_a": "Key stored for this provider: ",
+        "cfg_key_stored_b": " — leave blank to keep",
+        "cfg_key_none": "No key stored for this provider yet — enter one and it's remembered",
+        "cfg_need_base": "Enter an endpoint first (or pick a provider)",
+        "cfg_fetched_n": " models — click Save to apply",
+        "cfg_balance_money_a": " (topped up ",
+        "cfg_balance_money_b": " + granted ",
+        "cfg_balance_money_c": ")",
+        "cfg_unknown": "Unknown reason",
+
+        # --- evolution ---
+        "evo_auto": "Auto-evolve",
+        "evo_direction": "Evolution focus",
+        "evo_daily": "per day",
+        "evo_run_now": "Evolve now",
+        "evo_on": "· On",
+        "evo_off": "· Off",
+        "evo_today": "Today",
+        "evo_done": "Evolution complete: ",
+        "evo_pick_one": "Tap to reveal",
+        "evo_locked": "Locked",
+        "evo_unlocked": "Not locked · AI rotates the list daily",
+
+        # --- release notes ---
+        "upd_title": "Release notes",
+        "upd_desc": "Every self-update, auto-evolution and manual evolution leaves a record: version · time · what changed.",
+        "upd_empty": "Nothing here yet. Records appear after a self-update or evolution.",
+
+        # --- memory ---
+        "mem_title": "Memory",
+        "mem_long": "Long-term memory",
+        "mem_empty": "No memories yet. Chat a bit and it will distil them automatically.",
+
+        # --- task list ---
+        "todo_title": "Task list",
+        "todo_clear": "Clear list",
+
+        # --- tools / skills ---
+        "tool_need_pick": "Needs your decision",
+        "tool_switched": "Switched to ",
+
+        # --- common ---
+        "ok_copied": "Copied",
+        "ok_saved": "Saved",
+        "err_copy_fail": "Copy failed — long-press the message to select manually",
+        "err_generic": "Error: ",
+        "log_pick_a": "I picked this from the console run log: ",
+        "log_pick_b": " — here is its tail. First judge if anything is wrong; fix what you can, otherwise explain why:\n\n",
+        "evo_dir_help": "Click a capsule to lock that direction (click again to unlock); you can lock several at once. If none are locked, the AI picks a new batch each day. Both auto and manual evolution prioritise locked directions. “Per day” is the max auto-evolutions per day; manual ones don't count against it.<br>Every change is auto-backed up + syntax-checked and rolled back on failure; the service is watchdog-managed and self-recovers.",
+        "look_reset": "Restore defaults",
+        "chat_more_steps": "Expand / collapse earlier steps",
+        "queue_inject_title": "Queue this into the current task without interrupting it",
+        "queue_remove": "Remove",
+        "file": "File",
+        "file_no_preview": "Can't preview in browser — converted server-side",
+        "img_remove": "Remove image",
+        "chat_done_title": "Task finished — click to jump to latest",
+        "skill_gen_fail": "Generation failed: ",
+        "chat_slow": "Slow response… if the tablet was just unplugged, the system may have frozen it to save power",
+        "look_preset": "Preset",
+        "evo_ai_picking": "Asking AI to pick today's direction…",
+        "slash_hint": "↑↓ choose · Enter run · Tab complete · Esc close",
+        "at_hint": "@ reference file · ↑↓ choose · Enter insert · Esc close",
+        "sess_no_match_a": "No chats matching “",
+        "sess_no_match_b": "”",
+        "evo_per": "per day",
+        "evo_items": "items",
+        "evo_today_prefix": "Today ",
+        "cfg_no_models": "This backend has no /models API; showing built-in list (",
+        "cfg_no_models_mid": "), for reference only",
+        "cfg_balance": "Balance",
+        "cfg_used_local": "Local usage",
+        "cfg_points": "pts",
+        "log_ai_check": "【AI self-check: ",
+        "log_ai_fail": "Self-check failed: ",
+        "log_send_ai": "Send to AI",
+        "log_ai_analyzing": "AI analyzing…",
+        "sess_none": "No chats yet",
+        "chat_you_inject": "You (injected)",
+        "evo_auto": "Auto-evolve",
+        "evo_dir": "Direction",
+        "evo_btn_now": "Evolve now",
+        "log_none": "(no log files)",
+        "log_selected": "Selected ",
+        "chat_back_latest": "↓ Back to latest",
+        "chat_thinking": "Thinking",
+        "queue_pending": "Pending ",
+        "queue_clear": "Clear",
+        "queue_inject": "Inject",
+        "chat_interrupted": "Interrupted",
+        "chat_no_content": "No content",
+        "sess_archived_note": "Click an archived item to view its summary; the original is kept in archive/.",
+        "log_none_yet": "Nothing yet. It shows here after a self-update or evolution.",
+        "cfg_fetching_models": "Fetching models…",
+        "cfg_querying": "Querying…",
+        "cfg_fetch_fail": "Fetch failed: ",
+        "cfg_fetched": "Fetched ",
+        "evo_dir_hint": "Auto-picked by AI daily; click one to lock it in",
+        "cfg_custom_note": "Custom API: keys are remembered per endpoint",
+        "chat_copied": "Copied",
+        "chat_copy_fail": "Copy failed — long-press the message to select it",
+        "chat_copy_stale": "This code block is no longer cached",
+        "chat_copy": "Copy",
+        "ctx_compress_at_prefix": " (",
+        "ctx_at_static": "% to compress",
+        "sess_search_ph": "Search chats…",
+        "sess_empty": "(empty)",
+        "cfg_local_none": "Not detected · run local-model.sh start first",
+        "find_none": "No results",
+        "chat_search": "Search",
+        "in_stop": "Stop",
+        "in_stopping": "Stopping…",
+        "in_hint_queue": "Press Enter to queue — it sends when the current task finishes · Esc to interrupt",
+        "in_hint_stop": "Esc to interrupt the current task",
+        "cfg_name": "Name",
+        "cfg_name_ph": "Give this assistant a name",
+        "evo_daily": "Evolve daily",
+        "evo_dir": "Direction",
+        "evo_perday": "Per day",
+        "evo_today": "Today",
+        "evo_manual": "Manual",
+        "evo_btn_now": "Evolve now",
+        "cfg_changelog": "Changelog",
+        "cfg_memory": "Memory",
+        "cfg_memory_long": "Long-term memory",
+        "cfg_ctx": "Context",
+        "cfg_ctx_use": "Usage",
+        "cfg_compact": "Compaction",
+        "cfg_tools": "Tools",
+        "cfg_all": "All",
+        "th_skill": "Skill",
+        "th_desc": "Description",
+        "th_size": "Size",
+        "th_made": "Created",
+        "th_tool": "Tool",
+        "th_use": "Purpose",
+        "sess_new_btn": "New chat",
+        "ctl_identity": "Identity",
+        "evo_sec": "Evolution",
+        "ctl_look": "Appearance",
+        "ctl_log": "Logs",
+        "ctl_skill": "Skills",
+        "hello_h1": "How can I help?",
+        "hello_p": "Runs on this device — it can read files, run commands and organise things",
+        "reload_for_lang": "Switching language, reloading…",
+    },
+}
+
+def t(key: str, lang: str | None = None, **fmt) -> str:
+    """取一条界面文案。lang 为空时用全局界面语言；缺失则依次回落 中文 → key 本身。"""
+    lc = (lang or globals().get("UI_LANG") or "zh")
+    table = I18N_BUILD.get(lc) or {}
+    s = table.get(key)
+    if s is None:
+        s = I18N_BUILD["zh"].get(key)
+    if s is None:
+        return key
+    if fmt:
+        try:
+            s = s.format(**fmt)
+        except Exception:
+            pass
+    return s
+
+
+def detect_ui_lang(cfg: dict) -> str:
+    """决定界面语言：config.ui_language 优先，其次系统语言猜测，最后中文。"""
+    v = (cfg.get("ui_language") or "").strip()
+    if v and v in I18N_BUILD:
+        return v
+    # 从环境变量猜（Termux 里通常是 C 或空，猜不到就中文）
+    import os
+    for ev in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        raw = (os.environ.get(ev) or "").strip()
+        if not raw:
+            continue
+        low = raw.lower().replace("_", "-")
+        for code in ("zh", "en"):
+            if low.startswith(code):
+                return code
+    return "zh"
+
+
+UI_LANG = "zh"
+
+
+
 # ---------------------------------------------------------------- 网页界面
 
 WEB_HTML = r"""<!DOCTYPE html>
@@ -6750,11 +7790,11 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
   <aside class="side" id="side">
     <div class="side-h"><span class="dot" id="dot"></span><b id="aname">Sidekick</b><span class="m" id="model"></span>
       <button class="side-x" id="sidex" type="button" title="收起侧栏（双击分界线也能切换）">‹</button></div>
-    <button class="newbtn" id="newchat"><span class="plus">＋</span>新对话</button>
+    <button class="newbtn" id="newchat"><span class="plus">＋</span><span data-t="sess_new_btn">新对话</span></button>
     <div class="list" id="list"></div>
     <div class="side-f">
-      <button id="openctl">控制台</button>
-      <button id="openconf">设置</button>
+      <button id="openctl" data-t="nav_console">控制台</button>
+      <button id="openconf" data-t="nav_settings">设置</button>
     </div>
   </aside>
   <div class="gutter" id="gutter" title="拖动调整宽度 · 双击收起/展开"></div>
@@ -6765,24 +7805,24 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
       <button class="hamb" id="hamb"><svg class="ic" aria-hidden="true"><use href="#i-menu"/></svg></button>
       <span class="t1" id="topname">Sidekick</span>
       <span class="chip" id="topmodel"></span>
-      <span class="chip" id="topver" title="查看更新记录" style="cursor:pointer"></span>
+      <span class="chip" id="topver" title="查看更新记录" data-t-title="nav_updates" style="cursor:pointer"></span>
       <span class="chip warn" id="evo" style="display:none">进化中…</span>
-      <button class="chip" id="findbtn" type="button" title="在对话里搜索（Ctrl+F）"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg><span class="t"> 搜索</span></button>
+      <button class="chip" id="findbtn" type="button" title="在对话里搜索（Ctrl+F）" data-t-title="chat_find"><svg class="ic" aria-hidden="true"><use href="#i-search"/></svg><span class="t" data-t="chat_search"> 搜索</span></button>
     </div>
     <div class="findbar" id="findbar" style="display:none">
-      <input id="findq" type="text" placeholder="在对话里搜索…">
+      <input id="findq" type="text" placeholder="在对话里搜索…" data-t-ph="chat_find_ph">
       <span class="fi" id="findinfo">0/0</span>
-      <button id="findprev" type="button" title="上一个（Shift+Enter）">↑</button>
-      <button id="findnext" type="button" title="下一个（Enter）">↓</button>
-      <button id="findx" type="button" title="关闭（Esc）">×</button>
+      <button id="findprev" type="button" title="上一个（Shift+Enter）" data-t-title="chat_find_prev">↑</button>
+      <button id="findnext" type="button" title="下一个（Enter）" data-t-title="chat_find_next">↓</button>
+      <button id="findx" type="button" title="关闭（Esc）" data-t-title="chat_find_close">×</button>
     </div>
     <div class="body" id="body"><div id="root"></div></div>
     <div class="comp">
       <div class="ask" id="ask" style="display:none"></div>
       <div class="tdl" id="tdl" style="display:none">
-        <div class="tdl-h" id="tdl-h"><span class="tdl-ar" id="tdl-ar">▸</span><b>任务清单</b>
+        <div class="tdl-h" id="tdl-h"><span class="tdl-ar" id="tdl-ar">▸</span><b data-t="todo_title">任务清单</b>
           <span class="tdl-p" id="tdl-p"></span><span class="tdl-bar"><i id="tdl-i"></i></span>
-          <button class="tdl-x" id="tdl-x" type="button" title="清空清单">×</button></div>
+          <button class="tdl-x" id="tdl-x" type="button" title="清空清单" data-t-title="todo_clear">×</button></div>
         <div class="tdl-b" id="tdl-b"></div>
       </div>
       <div class="cmdp" id="cmdp" style="display:none"></div>
@@ -6790,9 +7830,9 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
       <div class="pq" id="pq" style="display:none"></div>
       <div class="att" id="att" style="display:none"></div>
       <div class="cwrap">
-        <button class="tbtn" id="imgbtn" type="button" title="发送图片或文件">+</button>
-        <textarea id="input" rows="1" placeholder="说点什么…"></textarea>
-        <button class="send" id="send">发送</button>
+        <button class="tbtn" id="imgbtn" type="button" title="发送图片或文件" data-t-title="in_attach">+</button>
+        <textarea id="input" rows="1" placeholder="说点什么…" data-t-ph="in_placeholder"></textarea>
+        <button class="send" id="send" data-t="in_send">发送</button>
       </div>
       <div class="tbar">
         <svg class="cring" viewBox="0 0 32 32" aria-hidden="true">
@@ -6823,7 +7863,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
 <!-- 控制台：名称 / 自我进化 / 记忆 / 上下文 -->
 <div class="sheet" id="ctl" style="display:none">
   <div class="card">
-    <div class="card-h"><b>控制台</b><button data-close="ctl">×</button></div>
+    <div class="card-h"><b data-t="nav_console">控制台</b><button data-close="ctl">×</button></div>
     <style>
     /* 控制台重排（2026-09-29）：顶部标签栏 + 进化页仪表盘（方案 A） */
     .ctabs{display:flex;align-items:flex-end;gap:2px;padding:6px 12px 0;border-bottom:1px solid var(--bd);overflow-x:auto;scrollbar-width:none;
@@ -6889,8 +7929,13 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         /* ---------- ① 切分小节 → pane ---------- */
         var panes = [];
         secs.forEach(function(st){
-          var nm = (st.firstChild && st.firstChild.nodeType === 3 ? st.firstChild.textContent : st.textContent) || '';
-          nm = nm.replace(/[\s\u3000]+/g, ' ').trim() || '设置';
+          /* 标题优先走多语言键：data-t 键 → T 取词 → 兜底原文字。
+             data-t 扫描会把 .sec-t 文本换成当前语言，但本脚本可能跑在它之前，
+             所以直接认 data-t 键最稳，不依赖执行先后。 */
+          var nm = (st.getAttribute && st.getAttribute('data-t') && T[st.getAttribute('data-t')] && T[st.getAttribute('data-t')] !== st.getAttribute('data-t'))
+                 ? T[st.getAttribute('data-t')]
+                 : ((st.firstChild && st.firstChild.nodeType === 3 ? st.firstChild.textContent : st.textContent) || '');
+          nm = nm.replace(/[\s\u3000]+/g, ' ').trim() || T.nav_settings;
           var pane = document.createElement('div');
           pane.className = 'pane'; pane.dataset.name = nm;
           body.insertBefore(pane, st);
@@ -6943,7 +7988,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
 
         var head = document.createElement('div'); head.className = 'st-row';
         var dot = document.createElement('span'); dot.className = 'st-dot'; dot.id = 'evo-dot';
-        var txt = document.createElement('span'); txt.className = 'st-txt'; txt.textContent = '自动进化';
+        var txt = document.createElement('span'); txt.className = 'st-txt'; txt.textContent = T.evo_auto;
         var stx = document.createElement('span'); stx.className = 'pmeta'; stx.id = 'evo-state';
         var sp = document.createElement('span'); sp.style.marginLeft = 'auto'; sp.style.display = 'flex';
         if(elSw){ var swp = document.createElement('label'); swp.className = 'sw-wrap'; swp.appendChild(elSw); sp.appendChild(swp); }
@@ -6955,17 +8000,17 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         var meta = document.createElement('div'); meta.className = 'pmeta'; meta.id = 'evo-meta'; ev.appendChild(meta);
 
         var h = document.createElement('div'); h.className = 'hrow';
-        var ht = document.createElement('span'); ht.textContent = '进化方向';
+        var ht = document.createElement('span'); ht.textContent = T.evo_dir;
         h.appendChild(ht);
         if(elTip){ elTip.style.marginLeft = '8px'; elTip.style.fontSize = '12px'; elTip.style.color = 'var(--t4)'; h.appendChild(elTip); }
         var det = document.createElement('details'); det.className = 'help';
-        det.innerHTML = '<summary>?</summary><div class="hb">点一颗胶囊即锁定该方向（再点一下取消），可同时锁定多个；不锁定就每天由 AI 自动换一批。自动进化与手动进化都优先按锁定的方向做。「每天几项」是自动进化每天最多做几项，手动点的不占额度。<br>每项改动都会自动备份 + 语法检查，失败立即还原；服务由看门狗托管，起不来会自动回滚。</div>';
+        det.innerHTML = '<summary>?</summary><div class="hb">' + T.evo_dir_help + '</div>';
         h.appendChild(det);
         ev.appendChild(h);
         if(elCap) ev.appendChild(elCap);
 
         var act = document.createElement('div'); act.className = 'act-row';
-        var sl = document.createElement('span'); sl.className = 'pmeta'; sl.textContent = '每天';
+        var sl = document.createElement('span'); sl.className = 'pmeta'; sl.textContent = T.evo_per;
         var seg = document.createElement('span'); seg.className = 'seg'; seg.id = 'evo-seg';
         [1, 2, 3, 4].forEach(function(v){
           var b = document.createElement('button'); b.type = 'button'; b.dataset.v = v; b.textContent = v + ' 项';
@@ -6975,10 +8020,10 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           };
           seg.appendChild(b);
         });
-        var sr = document.createElement('span'); sr.className = 'pmeta'; sr.textContent = '项';
+        var sr = document.createElement('span'); sr.className = 'pmeta'; sr.textContent = T.evo_items;
         var filler = document.createElement('span'); filler.style.flex = '1';
         act.appendChild(sl); act.appendChild(seg); act.appendChild(sr); act.appendChild(filler);
-        if(elGo){ elGo.className = 'abtn'; elGo.textContent = '立即进化一次'; act.appendChild(elGo); }
+        if(elGo){ elGo.className = 'abtn'; elGo.textContent = T.evo_btn_now; act.appendChild(elGo); }
         ev.appendChild(act);
 
         /* 进度/状态绘制：挂到 fillPanel 上（面板数据一到就同步） */
@@ -6990,7 +8035,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           var dt = document.getElementById('evo-dot'); if(dt) dt.className = 'st-dot' + (d.evolve_enabled ? ' on' : '');
           var sx = document.getElementById('evo-state'); if(sx) sx.textContent = d.evolve_enabled ? '· 已开启' : '· 已关闭';
           var em = document.getElementById('evo-meta');
-          if(em) em.textContent = '今日 ' + done + ' / ' + tgt + ' 项' + (d.evolve_date ? '（' + d.evolve_date + '）' : '');
+          if(em) em.textContent = T.evo_today_prefix + done + ' / ' + tgt + ' ' + T.evo_items + (d.evolve_date ? '（' + d.evolve_date + '）' : '');
           var sg = document.getElementById('evo-seg');
           if(sg){
             var v = d.evolve_per_day || 1;
@@ -7049,7 +8094,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         closeTip();
         tip = document.createElement('div');
         tip.className = 'qpop';
-        tip.innerHTML = '<div class="qbox"><button class="qx" type="button" aria-label="关闭">×</button>'
+        tip.innerHTML = '<div class="qbox"><button class="qx" type="button" aria-label="' + T.nav_close + '">×</button>'
                       + parts.map(function(x){ return '<p>' + x + '</p>'; }).join('')
                       + '</div>';
         document.body.appendChild(tip);
@@ -7074,7 +8119,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
       function mkQ(host, parts, before){
         if(!parts.length) return;
         var q = document.createElement('button');
-        q.type = 'button'; q.className = 'q'; q.textContent = '?'; q.title = '查看说明';
+        q.type = 'button'; q.className = 'q'; q.textContent = '?'; q.title = T.nav_help;
         var t = null, viaLong = false;
         q.addEventListener('click', function(e){
           e.stopPropagation();
@@ -7120,52 +8165,52 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
     })();
     </script>
     <div class="card-b">
-      <div class="sec-t">身份</div>
-      <div class="row"><span class="lb">名称</span><div class="ctl"><input type="text" id="p-name" maxlength="20" placeholder="给这个助手起个名字">
+      <div class="sec-t" data-t="ctl_identity">身份</div>
+      <div class="row"><span class="lb" data-t="cfg_name">名称</span><div class="ctl"><input type="text" id="p-name" maxlength="20" data-t-ph="cfg_name_ph" placeholder="给这个助手起个名字">
         <div class="note">这个助手在对话里自称的名字，只影响称谓，不影响任何功能。出厂默认叫 <b>Sidekick</b>；这里改成什么，它就自称什么。</div></div></div>
 
-      <div class="sec-t">进化</div>
-      <div class="row"><span class="lb">每天自动进化</span><div class="ctl"><label class="sw-wrap"><input class="sw" type="checkbox" id="p-enable"></label>
+      <div class="sec-t" data-t="evo_sec">进化</div>
+      <div class="row"><span class="lb" data-t="evo_daily">每天自动进化</span><div class="ctl"><label class="sw-wrap"><input class="sw" type="checkbox" id="p-enable"></label>
         <div class="note">开启后它每天会自己挑一件事来改进自己（改的是它自己的源码），一天最多按下面设定的项数做。关掉就只在你说「立即进化一次」时动手。</div>
         <div class="note">进化只在它闲着的时候跑，不会打断你正在进行的对话；每次只做一项，做完立刻验证。</div></div></div>
-      <div class="row"><span class="lb">进化方向</span><div class="ctl"><input type="hidden" id="p-dir">
+      <div class="row"><span class="lb" data-t="evo_dir">进化方向</span><div class="ctl"><input type="hidden" id="p-dir">
         <div class="caps" id="p-caps"></div>
         <div class="note" id="p-caps-tip"></div>
         <div class="note">点一颗即锁定为进化方向（再点它一下解锁）；不锁定就每天由 AI 自动换一批。</div>
         <div class="note">锁定之后，每天的自动进化都朝这一个方向使劲，不再换来换去 —— 适合你明确知道哪儿不够好、想集中改进的时候。</div></div></div>
-      <div class="row"><span class="lb">每天几项</span><div class="ctl"><input type="number" id="p-perday" min="1" max="10" value="1"></div></div>
-      <div class="row"><span class="lb">今日进度</span><div class="ctl"><span id="p-prog" style="font-size:14px"></span>
+      <div class="row"><span class="lb" data-t="evo_perday">每天几项</span><div class="ctl"><input type="number" id="p-perday" min="1" max="10" value="1"></div></div>
+      <div class="row"><span class="lb" data-t="evo_today">今日进度</span><div class="ctl"><span id="p-prog" style="font-size:14px"></span>
         <div class="note">今天已经进化了几项、还剩几项。进度写在 evolve.json 里，跨重启保留，第二天自动归零。</div>
         <div class="note" id="p-safe">每项改动都会自动备份 + 语法检查，失败立即还原；服务由看门狗托管，起不来会自动回滚。</div></div></div>
-      <div class="row" style="border-bottom:none"><span class="lb">手动进化</span><div class="ctl">
-        <button class="btn" id="p-evolve">立即进化一次</button>
+      <div class="row" style="border-bottom:none"><span class="lb" data-t="evo_manual">手动进化</span><div class="ctl">
+        <button class="btn" id="p-evolve" data-t="evo_btn_now">立即进化一次</button>
         <div class="note">按上面锁定的那颗方向做一项；没有锁定的就随机挑一颗。</div>
         <div class="note">不用等每天那次，随时可以让它马上进化一次。跑的时候给它点时间，改完会出现在「更新记录」里。</div>
       </div></div>
 
-      <div class="sec-t">更新记录 <span id="p-ver" style="color:var(--t4)"></span></div>
+      <div class="sec-t"><span data-t="cfg_changelog">更新记录</span> <span id="p-ver" style="color:var(--t4)"></span></div>
       <div class="row" style="border-bottom:none"><div class="ctl">
         <div class="log chg" id="p-chg"></div>
         <div class="note">每次自我更新 / 自动进化 / 手动进化都留一条：版本号 · 时间 · 改了什么。<b style="color:var(--brand)">高亮加粗</b>的是进化（它自己改自己）。</div>
         <div class="note">这里只显示最近 12 条，完整的都在 changelog.json 里，不会丢。点开任意一条能看这次到底动了哪里。</div>
         <div class="note">徽章含义：「自我更新」是你说一声让它改的（修 bug、加功能）；「自动进化」是它自己排的班；「手动进化」是你在上面点了「立即进化一次」。</div></div></div>
 
-      <div class="sec-t">记忆 <span id="p-memc" style="color:var(--t4)"></span></div>
-      <div class="row" style="border-bottom:none"><span class="lb">长期记忆</span><div class="ctl">
+      <div class="sec-t"><span data-t="cfg_memory">记忆</span> <span id="p-memc" style="color:var(--t4)"></span></div>
+      <div class="row" style="border-bottom:none"><span class="lb" data-t="cfg_memory_long">长期记忆</span><div class="ctl">
         <textarea id="p-mem" rows="7" placeholder="还没有积累记忆。多聊几句，它会自动提炼。"></textarea>
         <div class="note">从对话里自动沉淀的长期信息，每次对话都会带上。可以直接编辑或清空。</div>
         <div class="note">存的是稳定事实和你的偏好（设备型号、习惯、约定），不是流水账 —— 每聊一阵它会自己提炼一次，把琐碎过程挤掉。</div>
         <div class="note">上限 3000 字，超了会裁掉最旧的并存一份备份（memory.md.bak-*），所以写得再满也不会丢底稿。改完记得点下面的「保存」。</div></div></div>
 
-      <div class="sec-t">上下文</div>
-      <div class="row"><span class="lb">占用</span><div class="ctl"><span id="p-ctx" style="font-size:14px"></span>
+      <div class="sec-t" data-t="cfg_ctx">上下文</div>
+      <div class="row"><span class="lb" data-t="cfg_ctx_use">占用</span><div class="ctl"><span id="p-ctx" style="font-size:14px"></span>
         <div class="bar"><i id="p-bar"></i></div>
         <div class="note" id="p-win"></div>
         <div class="note">圆环分母是模型真实的窗口大小，不是估算：优先问接口的 /models，其次读本机模型的 n_ctx，再次查内置表，最后按模型名推断。有的接口（如智谱）不返回窗口字段，就只能走后面的兜底。</div></div></div>
-      <div class="row"><span class="lb">压缩时机</span><div class="ctl">
+      <div class="row"><span class="lb" data-t="cfg_compact">压缩时机</span><div class="ctl">
         <div style="display:flex;align-items:center;gap:7px;flex-wrap:nowrap">
           <input type="number" id="p-thr" min="10" max="95" step="5" style="width:60px;flex:0 0 auto">
-          <span style="color:var(--t3);white-space:nowrap">% 时压缩</span>
+          <span style="color:var(--t3);white-space:nowrap" data-t="ctx_at_static">% 时压缩</span>
           <span class="note" id="p-thrsrc"></span>
           <div class="note">输入框里的数字就是本对话当前使用的压缩阈值；点「应用到本对话」把它记在本对话上（不影响之后新开的对话）。<span id="p-thrsrc2"></span></div>
           <button class="btn" id="p-thr-sess" style="margin-left:auto;white-space:nowrap;font-size:13px;padding:8px 12px">应用到本对话</button>
@@ -7179,7 +8224,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         <div class="note">一次任务里模型最多来回调用工具多少轮，不够用就调大（默认 200）。</div>
         <div class="note">「一轮」= 模型想一次 + 调一次工具 + 拿到结果再想。像批量改文件、逐个查资料这种活容易用掉很多轮；如果任务总在中途停住说「达到轮次上限」，就把它调大。</div></div></div>
 
-      <div class="sec-t">外观</div>
+      <div class="sec-t" data-t="ctl_look">外观</div>
       <div id="ui-box"></div>
       <div class="row" style="border-bottom:none"><span class="lb"></span><div class="ctl">
         <div class="note" id="ui-st"></div>
@@ -7187,7 +8232,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         <div class="note">这里只管对话正文的排版，不影响侧边栏、按钮等界面本身。</div>
         <div class="note">「预设」是一键套用一整套搭配，套完还能逐项微调，不会锁死。想恢复原样，把各项调回中间值即可。</div></div></div>
 
-      <div class="sec-t">日志</div>
+      <div class="sec-t" data-t="ctl_log">日志</div>
       <div class="row" style="border-bottom:none"><span class="lb">日志文件</span><div class="ctl">
         <select id="lg-pick" style="width:100%"></select>
         <div class="note">选一个日志看它的末尾；点「AI 自检」会让模型读这段日志并给出：发生了什么 / 异常 / 可能原因 / 建议动作。</div>
@@ -7243,7 +8288,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
                  + '   ' + kb + ' KB   ' + esc(x.mtime) + '</option>';
           }).join('');
           if(keep){ Array.prototype.slice.call(pick.options).forEach(function(o){ if(o.value === keep) pick.value = keep; }); }
-          if(!list.length){ body.textContent = '(没有日志文件)'; return; }
+          if(!list.length){ body.textContent = T.log_none; return; }
           if(curName()) wsSend({cmd:'log_tail', name: curName(), tail: 300});
         }
 
@@ -7272,11 +8317,11 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
             if(ev === 'log_check'){
               if(d && d.ok){
                 ans.style.display = '';
-                ans.textContent = '【AI 自检：' + (d.name || '') + '，末尾 ' + (d.lines || 0) + ' 行】\n\n'
+                ans.textContent = T.log_ai_check + (d.name || '') + '，末尾 ' + (d.lines || 0) + ' 行】\n\n'
                   + (d.answer || '(空)');
               } else {
                 ans.style.display = '';
-                ans.textContent = '自检失败：' + ((d && d.error) || '未知原因');
+                ans.textContent = T.log_ai_fail + ((d && d.error) || '未知原因');
               }
               return;
             }
@@ -7297,7 +8342,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           if(!bar || !bar.parentNode) return;
           var fx = document.createElement('button');
           fx.type = 'button'; fx.className = 'btn pri';
-          fx.textContent = '发给 AI 解决';
+          fx.textContent = T.log_send_ai;
           fx.style.cssText = 'font-size:13px;padding:8px 14px';
           fx.onclick = function(){
             var nm = curName();
@@ -7307,8 +8352,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
             var inp = document.getElementById('input');
             var snd = document.getElementById('send');
             if(!inp || !snd){ toast('找不到输入框'); return; }
-            inp.value = '这是我从控制台「运行日志」里选的 ' + nm + ' 的末尾内容，'
-              + '请先判断有没有问题，能直接修的就动手修，修不了说明原因：\n\n'
+            inp.value = T.log_pick_a + nm + T.log_pick_b
               + '```\n' + txt.slice(-8000) + '\n```';
             try{ inp.dispatchEvent(new Event('input')); }catch(e){}
             document.getElementById('ctl').style.display = 'none';   /* 收掉控制台，回到对话 */
@@ -7318,23 +8362,23 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         })();
         document.getElementById('lg-check').onclick = function(){
           if(!curName()){ toast('先选一个日志文件'); return; }
-          ans.style.display = ''; ans.textContent = 'AI 正在分析…';
+          ans.style.display = ''; ans.textContent = T.log_ai_analyzing;
           wsSend({cmd:'log_check', name: curName(), tail: 300});
         };
         wsSend({cmd:'log_list'});
       })();
       </script>
 
-      <div class="sec-t">技能</div>
+      <div class="sec-t" data-t="ctl_skill">技能</div>
       <div class="row" style="border-bottom:none"><div class="ctl">
         <div class="axbar">
-          <label><input type="checkbox" id="sk-all"><span>全选</span></label>
+          <label><input type="checkbox" id="sk-all"><span data-t="cfg_all">全选</span></label>
           <span class="cnt" id="sk-cnt">已选 0</span>
           <button class="btn" id="sk-del" disabled>删除选中</button>
         </div>
         <div class="tbwrap">
           <table class="tb">
-            <thead><tr><th class="ck"></th><th>技能</th><th>说明</th><th>大小</th><th>建立</th></tr></thead>
+            <thead><tr><th class="ck"></th><th data-t="th_skill">技能</th><th data-t="th_desc">说明</th><th data-t="th_size">大小</th><th data-t="th_made">建立</th></tr></thead>
             <tbody id="sk-list"></tbody>
           </table>
         </div>
@@ -7342,17 +8386,17 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         <div class="note">为什么要有技能：同样的坑踩过一次就够了。这些文档平时不占上下文，只在碰上相关任务时才被读进来，所以放多少都不影响日常对话。</div>
       </div></div>
 
-      <div class="sec-t">工具</div>
+      <div class="sec-t" data-t="cfg_tools">工具</div>
       <div class="row" style="border-bottom:none"><div class="ctl">
         <div class="axbar">
-          <label><input type="checkbox" id="tl-all"><span>全选</span></label>
+          <label><input type="checkbox" id="tl-all"><span data-t="cfg_all">全选</span></label>
           <span class="cnt" id="tl-cnt">已选 0</span>
           <button class="btn" id="tl-off" disabled>禁用选中</button>
           <button class="btn" id="tl-on" disabled>恢复选中</button>
         </div>
         <div class="tbwrap">
           <table class="tb">
-            <thead><tr><th class="ck"></th><th>工具</th><th>用途</th></tr></thead>
+            <thead><tr><th class="ck"></th><th data-t="th_tool">工具</th><th data-t="th_use">用途</th></tr></thead>
             <tbody id="tl-list"></tbody>
           </table>
         </div>
@@ -7510,7 +8554,7 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           if(d.loading) return;
           if(d.error){
             var t1 = document.querySelector('tr.skexp > td');
-            if(t1) t1.innerHTML = '<div class="skexp-err">生成失败：' + esc(d.error)
+            if(t1) t1.innerHTML = '<div class="skexp-err">' + T.skill_gen_fail + esc(d.error)
                                 + '<br>（可点「重新解释」再试一次）</div>';
             return;
           }
@@ -7542,14 +8586,14 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         function syncSel(){
           /* 技能页 */
           var a1 = boxes('sk'), s1 = checked('sk');
-          var el1 = document.getElementById('sk-cnt'); if(el1) el1.textContent = '已选 ' + s1.length;
+          var el1 = document.getElementById('sk-cnt'); if(el1) el1.textContent = T.log_selected + s1.length;
           var bb1 = document.getElementById('sk-all');
           if(bb1){ bb1.checked = a1.length > 0 && s1.length === a1.length;
                    bb1.indeterminate = s1.length > 0 && s1.length < a1.length; }
           var d1 = document.getElementById('sk-del'); if(d1) d1.disabled = !s1.length;
           /* 工具页 */
           var a2 = boxes('tl'), s2 = checked('tl');
-          var el2 = document.getElementById('tl-cnt'); if(el2) el2.textContent = '已选 ' + s2.length;
+          var el2 = document.getElementById('tl-cnt'); if(el2) el2.textContent = T.log_selected + s2.length;
           var bb2 = document.getElementById('tl-all');
           if(bb2){ bb2.checked = a2.length > 0 && s2.length === a2.length;
                    bb2.indeterminate = s2.length > 0 && s2.length < a2.length; }
@@ -7624,28 +8668,30 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
 <!-- 设置：模型 / Key / 权限 -->
 <div class="sheet" id="conf" style="display:none">
   <div class="card">
-    <div class="card-h"><b>设置</b><button data-close="conf">×</button></div>
+    <div class="card-h"><b data-t="nav_settings">设置</b><button data-close="conf">×</button></div>
     <div class="card-b">
-      <div class="row"><span class="lb">品牌</span><div class="ctl"><select id="c-brand"></select></div></div>
-      <div class="row"><span class="lb">API Key</span><div class="ctl"><input type="password" id="c-key" autocomplete="off" placeholder="sk-…（留空则不变）">
+      <div class="row"><span class="lb" data-t="nav_lang">语言</span><div class="ctl"><select id="c-lang"></select>
+        </div></div>
+      <div class="row"><span class="lb" data-t="cfg_brand">品牌</span><div class="ctl"><select id="c-brand"></select></div></div>
+      <div class="row"><span class="lb" data-t="cfg_key">API Key</span><div class="ctl"><input type="password" id="c-key" autocomplete="off" data-t-ph="cfg_key_ph" placeholder="sk-…（留空则不变）">
         <div class="st" id="c-keyst"></div></div></div>
-      <div class="row"><span class="lb">接口地址</span><div class="ctl"><input type="text" id="c-base" placeholder="https://api.deepseek.com/v1"></div></div>
-      <div class="row"><span class="lb">模型</span><div class="ctl">
-        <div class="duo"><select id="c-model"></select><button class="btn" id="c-pull" type="button">拉取</button></div>
+      <div class="row"><span class="lb" data-t="cfg_base_url">接口地址</span><div class="ctl"><input type="text" id="c-base" data-t-ph="cfg_base_ph" placeholder="https://api.deepseek.com/v1"></div></div>
+      <div class="row"><span class="lb" data-t="cfg_model">模型</span><div class="ctl">
+        <div class="duo"><select id="c-model"></select><button class="btn" id="c-pull" type="button" data-t="cfg_pull">拉取</button></div>
         <div class="st" id="c-modelst"></div></div></div>
-      <div class="row"><span class="lb">余额</span><div class="ctl">
-        <div class="duo"><div class="st" id="c-bal" style="flex:1;min-width:0;margin-top:0">点「查询」看剩余额度</div><button class="btn" id="c-balbtn" type="button">查询</button></div></div></div>
-      <div class="row" style="border-bottom:none"><span class="lb">增强权限</span><div class="ctl"><input class="sw" type="checkbox" id="c-shell">
-        <div class="note">以 shell（adb）身份执行命令，可读系统设置、dumpsys、pm/am。不是 root。</div></div></div>
-      <div class="note">选好「品牌」，接口地址会自动填上，不必手打。</div>
-      <div class="note">预设覆盖 DeepSeek、智谱、通义等常见品牌，选中即自动填接口地址。用自建或代理服务时选「自定义」，自己填地址。</div>
-      <div class="note">各品牌的 API Key 分开记住：换品牌不会丢、也不会互相覆盖。要改哪个品牌，选中它、重新输入一次即可。</div>
-      <div class="note">Key 存在本机 config.json 里，只用于向对应接口发请求；这个界面只监听 127.0.0.1，不对局域网开放。</div>
-      <div class="note">填好 Key 后点「拉取」获取该接口的可用模型；点「查询」看余额或积分。</div>
-      <div class="note">「拉取」拿到的是接口当前真实提供的模型列表，所以新模型上线不用等更新，拉一次就有。</div>
+      <div class="row"><span class="lb" data-t="cfg_balance">余额</span><div class="ctl">
+        <div class="duo"><div class="st" id="c-bal" style="flex:1;min-width:0;margin-top:0" data-t="cfg_balance_tip">点「查询」看剩余额度</div><button class="btn" id="c-balbtn" type="button" data-t="cfg_query_btn">查询</button></div></div></div>
+      <div class="row" style="border-bottom:none"><span class="lb" data-t="cfg_shell">增强权限</span><div class="ctl"><input class="sw" type="checkbox" id="c-shell">
+        <div class="note" data-t="cfg_shell_note">以 shell（adb）身份执行命令，可读系统设置、dumpsys、pm/am。不是 root。</div></div></div>
+      <div class="note" data-t="cfg_note1">选好「品牌」，接口地址会自动填上，不必手打。</div>
+      <div class="note" data-t="cfg_note2">预设覆盖 DeepSeek、智谱、通义等常见品牌，选中即自动填接口地址。用自建或代理服务时选「自定义」，自己填地址。</div>
+      <div class="note" data-t="cfg_note3">各品牌的 API Key 分开记住：换品牌不会丢、也不会互相覆盖。要改哪个品牌，选中它、重新输入一次即可。</div>
+      <div class="note" data-t="cfg_note4">Key 存在本机 config.json 里，只用于向对应接口发请求；这个界面只监听 127.0.0.1，不对局域网开放。</div>
+      <div class="note" data-t="cfg_note5">填好 Key 后点「拉取」获取该接口的可用模型；点「查询」看余额或积分。</div>
+      <div class="note" data-t="cfg_note6">「拉取」拿到的是接口当前真实提供的模型列表，所以新模型上线不用等更新，拉一次就有。</div>
     </div>
     <div class="card-h" style="border-top:1px solid var(--bd);border-bottom:none;border-radius:0 0 16px 16px;justify-content:flex-end">
-      <button class="btn pri" id="c-save" style="font-size:14px;padding:10px 22px">保存</button>
+      <button class="btn pri" id="c-save" style="font-size:14px;padding:10px 22px" data-t="cfg_save">保存</button>
     </div>
   </div>
 </div>
@@ -7653,6 +8699,55 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
 <div class="toast" id="toast"></div>
 
 <script>
+/* ---------------- 多语言：T 取词对象 ---------------- */
+/* 服务端在 </head> 前注入了 window.__I18N__ = {lang, dir, dict, meta}。
+   用法：T.in_send → "Send"；T.xxx(值) → 带参数的模板。
+   缺失的键返回键名本身，便于一眼看出漏翻。 */
+const _I18N = window.__I18N__ || {lang:'zh', dir:'ltr', dict:{}, meta:{}};
+const T = new Proxy(_I18N.dict, {
+  get(d, k){ return (k in d) ? d[k] : String(k); }
+});
+/* 扫一遍带 data-t 的静态节点，把文案换掉。
+   放在 DOMContentLoaded 里跑，早于其它渲染逻辑。 */
+function applyI18N(rootEl){
+  const scope = rootEl || document;
+  scope.querySelectorAll('[data-t]').forEach(el => {
+    const k = el.getAttribute('data-t');
+    const v = T[k];
+    if (v && v !== k) el.textContent = v;
+  });
+  /* 带属性的：data-t-title / data-t-ph（placeholder） */
+  scope.querySelectorAll('[data-t-title]').forEach(el => {
+    const v = T[el.getAttribute('data-t-title')];
+    if (v) el.setAttribute('title', v);
+  });
+  scope.querySelectorAll('[data-t-ph]').forEach(el => {
+    const v = T[el.getAttribute('data-t-ph')];
+    if (v) el.setAttribute('placeholder', v);
+  });
+  if (_I18N.dir === 'rtl') document.documentElement.setAttribute('dir','rtl');
+  document.documentElement.setAttribute('lang', _I18N.lang || 'zh');
+}
+/* 界面文案是动态生成的（欢迎语、步骤卡片、会话列表…），一次性扫不够。
+   盯着 DOM 新增的节点，自动把 data-t 的翻掉 —— 覆盖全站，不必逐个函数改。 */
+(function watchI18N(){
+  if (!window.MutationObserver) return;
+  const obs = new MutationObserver(muts => {
+    for (const m of muts){
+      for (const n of m.addedNodes){
+        if (n.nodeType !== 1) continue;
+        if (n.hasAttribute && n.hasAttribute('data-t')) {
+          const v = T[n.getAttribute('data-t')];
+          if (v && v !== n.getAttribute('data-t')) n.textContent = v;
+        }
+        if (n.querySelectorAll) applyI18N(n);
+      }
+    }
+  });
+  const start = () => obs.observe(document.body, {childList:true, subtree:true});
+  if (document.body) start(); else document.addEventListener('DOMContentLoaded', start);
+})();
+
 /* 图标引用：<svg class="ic"><use href="#i-名字"/></svg>，用法 ic('mic') */
 const ic = (n, cls) => '<svg class="ic' + (cls ? ' ' + cls : '') +
                        '" aria-hidden="true"><use href="#i-' + n + '"/></svg>';
@@ -7662,6 +8757,7 @@ let ws = null, wsReady = false, outq = [], reconnectTimer = null, lastEvtAt = Da
 let streaming = false, cur = null, curText = '', steps = null, stepsData = [], stepsElided = 0, lastError = false;
 let stepsPinned = false;   /* 用户自己点过工具卡片的开合 → 本轮不再自动开合（2026-10-01） */
 let cmdSel = 0, cmdShown = [], curSidVal = '';   /* 斜杠命令面板 / 当前会话 id */
+let curUiLang = _I18N.lang || 'zh', langChanged = false;   /* 界面语言 / 本次保存是否改了语言 */
 let wantSid = '';                                /* 我主动要切过去的会话 id（见 hello 处理） */
 let busySid = '';        /* 正在回复中的会话是哪个（不同对话各跑各的，按钮状态别看错） */
 
@@ -7888,7 +8984,7 @@ function render(src, depth){
     if(codeMap.size > 300){ codeMap.delete(codeMap.keys().next().value); }
     const lg = langs[+i] ? '<span class="lg">' + esc(langs[+i]) + '</span>' : '';
     return '<div class="cbx">' + lg
-      + '<button class="cbc" type="button" data-c="' + id + '">复制</button>'
+      + '<button class="cbc" type="button" data-c="' + id + '">' + T.chat_copy + '</button>'
       + '<pre>' + esc(codes[i]) + '</pre></div>';
   });
 }
@@ -7898,14 +8994,14 @@ root.addEventListener('click', e => {
   const b = e.target && e.target.closest ? e.target.closest('.cbc') : null;
   if(!b) return;
   const t = codeMap.get(Number(b.dataset.c));
-  if(t == null){ toast('这段代码已经不在缓存里了'); return; }
+  if(t == null){ toast(T.chat_copy_stale); return; }
   copyText(t, b);
 });
 /* ---------------- 消息渲染 ---------------- */
 function atBottom(){ return body.scrollHeight - body.scrollTop - body.clientHeight < 110; }
 /* 「回到最新」：上滑看历史时新内容不打断阅读，给个一键回到底部的入口 */
 const jump = document.createElement('button');
-jump.type = 'button'; jump.className = 'jump'; jump.textContent = '↓ 回到最新';
+jump.type = 'button'; jump.className = 'jump'; jump.textContent = T.chat_back_latest;
 jump.onclick = () => { body.scrollTop = body.scrollHeight; syncJump(); };
 (function initJump(){
   const st = document.createElement('style');
@@ -7928,7 +9024,7 @@ function copyText(text, btn){
   const done = () => {
     if(!btn) return;
     const old = btn.textContent;
-    btn.textContent = '已复制'; btn.classList.add('ok');
+    btn.textContent = T.chat_copied; btn.classList.add('ok');
     setTimeout(() => { btn.textContent = old; btn.classList.remove('ok'); }, 1400);
   };
   const fallback = () => {
@@ -7940,7 +9036,7 @@ function copyText(text, btn){
     let ok = false;
     try{ ok = document.execCommand('copy'); }catch(e){ ok = false; }
     ta.remove();
-    if(ok) done(); else toast('复制失败，请长按消息手动选择');
+    if(ok) done(); else toast(T.chat_copy_fail);
   };
   if(navigator.clipboard && navigator.clipboard.writeText){
     navigator.clipboard.writeText(text).then(done).catch(fallback);
@@ -8045,7 +9141,7 @@ function finishThought(collapse){
   if(collapse !== false) box.classList.remove('open');
   if(body) body.textContent = thoughtBuf;
   const ttl = box.querySelector('.ttl');
-  if(ttl) ttl.textContent = '思考过程';
+  if(ttl) ttl.textContent = T.chat_thinking;
   const cn = box.querySelector('.cnt');
   if(cn) cn.textContent = thoughtBuf.length + ' 字';
 }
@@ -8078,7 +9174,7 @@ function showWelcome(){
   root.innerHTML = '';
   const d = document.createElement('div');
   d.className = 'welcome'; d.id = 'welcome';
-  d.innerHTML = `<h1>有什么可以帮你？</h1><p>它在本机运行，可以看文件、跑命令、整理资料</p>
+  d.innerHTML = `<h1 data-t="hello_h1">有什么可以帮你？</h1><p data-t="hello_p">它在本机运行，可以看文件、跑命令、整理资料</p>
     <div class="chips">
       <button>看看现在磁盘还剩多少空间</button>
       <button>列出下载文件夹里最大的几个文件</button>
@@ -8087,6 +9183,7 @@ function showWelcome(){
     </div>`;
   d.querySelectorAll('.chips button').forEach(b => b.onclick = () => { input.value = b.textContent; submit(); });
   root.appendChild(d);
+  applyI18N(d);                     /* 欢迎语是动态生成的，生成完立刻按当前语言翻译 */
 }
 function renderHistory(msgs){
   root.innerHTML = ''; liveSteps = {};
@@ -8100,7 +9197,7 @@ function renderHistory(msgs){
       if(rc && String(rc).trim()){
         const box = d.querySelector('.thinkbox');
         box.style.display = ''; box.classList.add('done');
-        box.querySelector('.ttl').textContent = '思考过程';
+        box.querySelector('.ttl').textContent = T.chat_thinking;
         box.querySelector('.thinkbody').textContent = rc;
         box.querySelector('.cnt').textContent = String(rc).length + ' 字';
       }
@@ -8318,7 +9415,7 @@ function pushStep(t){
       li.classList.toggle('op', !open);
     };
     const cp = document.createElement('button');
-    cp.className = 'cpbtn'; cp.type = 'button'; cp.textContent = '复制';
+    cp.className = 'cpbtn'; cp.type = 'button'; cp.textContent = T.chat_copy;
     cp.onclick = e => { e.stopPropagation(); copyText(stepCopy(t), cp); };
     li.querySelector('.det').appendChild(cp);
   }
@@ -8343,7 +9440,7 @@ function pushStep(t){
     const _mtxt = () => ol.classList.contains('showall')
       ? `收起更早的 ${stepsElided} 步` : `…更早的 ${stepsElided} 步已折叠（点开看）`;
     more.textContent = _mtxt();
-    more.title = '点击展开 / 收起更早的步骤';
+    more.title = T.chat_more_steps;
     more.onclick = () => { ol.classList.toggle('showall'); more.textContent = _mtxt(); toBottom(); };
   }
   /* 标题行始终报进度：卡片收起来时也能一眼知道在干什么 */
@@ -8373,7 +9470,7 @@ function armSlowHint(){
     if(!streaming || !cur) return;
     const th = cur.querySelector('.think');
     if(th && th.style.display !== 'none')
-      th.innerHTML = '<span class="sp"></span>响应较慢…若平板刚拔掉电源线，可能被系统省电冻结了';
+      th.innerHTML = '<span class="sp"></span>' + T.chat_slow;
   }, 25000);
 }
 let pending = [];   /* 助手正在干活时先排队的消息（存浏览器本地，刷新不丢） */
@@ -8392,15 +9489,15 @@ function renderPending(){
   if(!pending.length){ box.style.display = 'none'; return; }
   box.style.display = '';
   const h = document.createElement('div'); h.className = 'pq-h';
-  const lb = document.createElement('span'); lb.textContent = '待发送 ' + pending.length + ' 条（当前任务结束后自动发出）';
-  const clr = document.createElement('button'); clr.className = 'pq-clr'; clr.type = 'button'; clr.textContent = '清空';
+  const lb = document.createElement('span'); lb.textContent = T.queue_pending + pending.length + ' 条（当前任务结束后自动发出）';
+  const clr = document.createElement('button'); clr.className = 'pq-clr'; clr.type = 'button'; clr.textContent = T.queue_clear;
   clr.onclick = () => { pending = []; pqSave(); renderPending(); refreshSend(); };
   h.appendChild(lb); h.appendChild(clr); box.appendChild(h);
   pending.forEach((it, i) => {
     const c = document.createElement('div'); c.className = 'pq-item';
     const s = document.createElement('span'); s.className = 'pq-t'; s.textContent = it.s || it.t;
-    const q = document.createElement('button'); q.className = 'pq-x'; q.type = 'button'; q.textContent = '插队';
-    q.title = '不中断当前任务，把这条插进当前任务里';
+    const q = document.createElement('button'); q.className = 'pq-x'; q.type = 'button'; q.textContent = T.queue_inject;
+    q.title = T.queue_inject_title;
     q.style.cssText = 'width:auto;padding:0 8px;margin-right:4px;font-size:12px';
     q.onclick = () => {
       if(!streaming){ toast('当前没有在跑的任务，直接发就行'); return; }
@@ -8409,7 +9506,7 @@ function renderPending(){
       pqSave(); renderPending(); refreshSend();
       toast('已插队，任务不会中断');
     };
-    const x = document.createElement('button'); x.className = 'pq-x'; x.type = 'button'; x.textContent = '×'; x.title = '移除';
+    const x = document.createElement('button'); x.className = 'pq-x'; x.type = 'button'; x.textContent = '×'; x.title = T.queue_remove;
     x.onclick = () => { pending.splice(i, 1); pqSave(); renderPending(); refreshSend(); };
     c.appendChild(s); c.appendChild(q); c.appendChild(x); box.appendChild(c);
   });
@@ -8463,18 +9560,18 @@ function renderAtt(){
   } else if(attach.file){
     const fb = document.createElement('span'); fb.className = 'ic';
     fb.textContent = (String(attach.name).split('.').pop() || '?').toUpperCase().slice(0, 4);
-    fb.title = '文件';
+    fb.title = T.file;
     box.appendChild(fb);
   } else {
     const icEl = document.createElement('span'); icEl.className = 'ic';
     icEl.innerHTML = ic('image');
-    icEl.title = '浏览器无法预览，由服务端转换';
+    icEl.title = T.file_no_preview;
     box.appendChild(icEl);
   }
   const n = document.createElement('span'); n.className = 'n'; n.textContent = attach.name;
   if(attach.info) n.title = attach.info;
   const x = document.createElement('button'); x.className = 'x'; x.type = 'button';
-  x.textContent = '×'; x.title = '移除图片';
+  x.textContent = '×'; x.title = T.img_remove;
   x.onclick = () => { attach = null; renderAtt(); refreshSend(); };
   box.appendChild(n); box.appendChild(x);
 }
@@ -8609,12 +9706,12 @@ function setCtx(p, d){
     };
     var used = (d && typeof d.context_tokens === 'number') ? d.context_tokens : 0;
     if(!winTok){
-      tx.textContent = '上下文 0 / 0 token · 0%';
+      tx.textContent = T.ctx_ring0;
     } else {
       /* 单位统一用 token：窗口是模型真实值（云端 /models、本地 /props 或按模型名推断），
          已用 token 由字符数换算而来（1 token ≈ 1.5 字），所以带个 ≈。 */
-      tx.textContent = '已用 ≈' + fmt(used) + ' / ' + fmt(winTok) + ' token · '
-                     + Math.round(ringPct) + '%（' + ratio + '% 时压缩）';
+      tx.textContent = T.ctx_used + fmt(used) + ' / ' + fmt(winTok) + ' token · '
+                     + Math.round(ringPct) + T.ctx_compress_at_prefix + ratio + T.ctx_compress_at;
     }
   }
   /* 兼容：旧的线性条若还留在页面上，也一起同步 */
@@ -8631,19 +9728,19 @@ function refreshSend(){
   const hint = $('#hint');
   if(hint){
     hint.textContent = streaming
-      ? (has ? '回车排队，这条会在当前任务结束后自动发出 · Esc 中断' : 'Esc 中断当前任务')
-      : 'Enter 发送 · Shift+Enter 换行 · ↑↓ 翻历史 · @ 引用文件 · / 看命令';
+      ? (has ? T.in_hint_queue : T.in_hint_stop)
+      : T.in_hint_full;
   }
   if(streaming && has){
-    send.classList.remove('stop'); send.textContent = '发送'; send.onclick = submit;
+    send.classList.remove('stop'); send.textContent = T.in_send; send.onclick = submit;
   } else if(streaming){
     send.classList.add('stop');
     if(send.dataset.stopping === '1'){
       /* 已经请求过停止：显示明确状态，别让人以为按钮卡死了 */
-      send.textContent = '停止中…';
+      send.textContent = T.in_stopping;
       send.onclick = null;
     } else {
-      send.textContent = '停止';
+      send.textContent = T.in_stop;
       send.onclick = () => {
         send.dataset.stopping = '1';
         wsSend({cmd:'stop'});
@@ -8663,7 +9760,7 @@ function refreshSend(){
     }
   } else {
     send.dataset.stopping = '';
-    send.classList.remove('stop'); send.textContent = '发送'; send.onclick = submit;
+    send.classList.remove('stop'); send.textContent = T.in_send; send.onclick = submit;
   }
 }
 function setBusy(on){
@@ -8687,7 +9784,7 @@ function finishLiveSteps(){
     if(!li.querySelector('.stopnote')){
       const sp = document.createElement('span');
       sp.className = 'a stopnote';
-      sp.textContent = '已中断';
+      sp.textContent = T.chat_interrupted;
       const v = li.querySelector('.hd .v');
       if(v) v.insertAdjacentElement('afterend', sp); else li.querySelector('.hd').appendChild(sp);
     }
@@ -8697,7 +9794,7 @@ function finishLiveSteps(){
    就在标题栏（对话名左边）冒个蓝色小圆点；点它、或点屏幕任意处即消失 */
 const doneDot = document.createElement('span');
 doneDot.id = 'doneDot';
-doneDot.title = '任务已完成，点这里回到最新';
+doneDot.title = T.chat_done_title;
 doneDot.style.cssText = 'display:none;flex:0 0 auto;width:9px;height:9px;border-radius:50%;'
   + 'background:var(--brand);box-shadow:0 0 0 3px rgba(65,118,230,.25);cursor:pointer';
 (function initDoneDot(){
@@ -8720,7 +9817,7 @@ function finishTurn(){
     const b = cur.querySelector('.bub');
     if(b && b.style.display !== 'none') b.innerHTML = render(curText);
     const th = cur.querySelector('.think');
-    if(th && th.style.display !== 'none' && !curText && !stepsData.length) th.innerHTML = '没有返回内容';
+    if(th && th.style.display !== 'none' && !curText && !stepsData.length) th.innerHTML = T.chat_no_content;
   }
   if(stepsData.length){
     doneAll();
@@ -8907,7 +10004,7 @@ function showAsk(d){
   if(!qs.length) return;
   askNow = {id: d.id, qs: qs, sel: qs.map(q => q.multi ? [] : ''), txt: qs.map(() => '')};
   box.style.display = '';
-  box.innerHTML = '<div class="ask-h"><span class="dot"></span>需要你拍板</div><div class="ask-b">'
+  box.innerHTML = '<div class="ask-h"><span class="dot"></span>' + T.tool_need_pick + '</div><div class="ask-b">'
     + qs.map((q, i) =>
         '<div class="ask-q"><div><span class="n">' + (i + 1) + '.</span>' + esc(q.question) + '</div>'
         + ((q.options && q.options.length)
@@ -9001,7 +10098,7 @@ function onAgentEvent(e){
       const txt = String(e.v).replace('已插队你的消息：', '');
       const d = document.createElement('div');
       d.className = 'turn me';
-      d.innerHTML = '<div class="who"><span>你（插队）</span></div><div class="bub"></div>';
+      d.innerHTML = '<div class="who"><span>' + T.chat_you_inject + '</span></div><div class="bub"></div>';
       d.querySelector('.bub').textContent = txt;
       if(steps && steps.isConnected && steps.parentNode){
         steps.parentNode.insertBefore(d, steps.nextSibling);
@@ -9055,11 +10152,11 @@ function renderSessions(d){
   lastSess = d;
   const list = $('#list'); list.innerHTML = '';
   const cur = d.current, ss = d.sessions || [], ar = d.archived || [];
-  if(!ss.length && !ar.length){ list.innerHTML = '<div class="grp">还没有对话</div>'; return; }
+  if(!ss.length && !ar.length){ list.innerHTML = '<div class="grp">' + T.sess_none + '</div>'; return; }
   const grp1 = document.createElement('div'); grp1.className = 'grp';
-  grp1.textContent = '最近对话'; list.appendChild(grp1);
+  grp1.textContent = T.sess_recent; list.appendChild(grp1);
   if(!ss.length){
-    const e = document.createElement('div'); e.className = 'grp'; e.textContent = '（空）';
+    const e = document.createElement('div'); e.className = 'grp'; e.textContent = T.sess_empty;
     list.appendChild(e);
   }
   ss.forEach(s => {
@@ -9172,7 +10269,7 @@ function renderSessions(d){
     if(arOpen){
       const n = document.createElement('div'); n.className = 'grp';
       n.style.cssText = 'font-size:11px;line-height:1.6;padding-top:6px';
-      n.textContent = '点归档项可看摘要；原文完整保存在 archive/ 目录里。';
+      n.textContent = T.sess_archived_note;
       list.appendChild(n);
     }
   }
@@ -9212,7 +10309,7 @@ function fillPanel(d){
   const chg = $('#p-chg');
   if(chg){
     const items = d.changelog || [];
-    if(!items.length){ chg.innerHTML = '<div>还没有记录。自我更新或进化后会显示在这里。</div>'; }
+    if(!items.length){ chg.innerHTML = '<div>' + T.log_none_yet + '</div>'; }
     else{
       chg.innerHTML = items.map(x => {
         const isEvo = !!x.kind && x.kind !== '自我更新';
@@ -9310,7 +10407,7 @@ function renderAppearance(){
     /* 三档预设按钮 */
     const row = document.createElement('div');
     row.className = 'row';
-    row.innerHTML = '<span class="lb">预设</span><div class="ctl"><div class="seg" id="ui-preset"></div>' +
+    row.innerHTML = '<span class="lb">' + T.look_preset + '</span><div class="ctl"><div class="seg" id="ui-preset"></div>' +
                     '<div class="note">一键套用一组搭配，再按需微调下面各项。</div></div>';
     box.appendChild(row);
     const seg = row.querySelector('#ui-preset');
@@ -9353,7 +10450,7 @@ function renderAppearance(){
     const fr = document.createElement('div');
     fr.className = 'row';
     fr.style.borderBottom = 'none';
-    fr.innerHTML = '<span class="lb"></span><div class="ctl"><button class="btn" type="button" id="ui-reset">恢复默认</button></div>';
+    fr.innerHTML = '<span class="lb"></span><div class="ctl"><button class="btn" type="button" id="ui-reset">' + T.look_reset + '</button></div>';
     box.appendChild(fr);
     fr.querySelector('#ui-reset').onclick = () => {
       applyAppearance(Object.assign({}, uiDefaults)); uiDirty = true; syncUI(); markPreset();
@@ -9411,25 +10508,38 @@ function fillConf(d){
   }
   /* —— 本地模型分组（本机 llama-server，离线也能用）—— */
   const g = document.createElement('optgroup');
-  g.label = localModels.length ? '本地模型（离线可用）' : '本地模型（服务未启动）';
+  g.label = localModels.length ? T.cfg_local_offline : T.cfg_local_stopped;
   localModels.forEach(m => {
     const o = document.createElement('option');
     o.value = 'local::' + m;
-    o.textContent = m + '（本地）';
+    o.textContent = m + T.cfg_local_suffix;
     if(curIsLocal && m === d.model){ o.selected = true; found = true; }
     g.appendChild(o);
   });
   if(!localModels.length){
     const o = document.createElement('option');
-    o.textContent = '未检测到 · 先执行 local-model.sh start';
+    o.textContent = T.cfg_local_none;
     o.disabled = true; g.appendChild(o);
   }
   sel.appendChild(g);
-  const o2 = document.createElement('option'); o2.value = '__custom__'; o2.textContent = '自定义…'; sel.appendChild(o2);
+  const o2 = document.createElement('option'); o2.value = '__custom__'; o2.textContent = T.cfg_custom; sel.appendChild(o2);
   $('#c-base').value = d.base_url || '';
   if(curIsLocal) $('#c-base').value = d.base_url || localUrl;
   $('#c-shell').checked = !!d.shell_access;
   /* —— 品牌下拉：预设各家接口地址，选中即自动填 —— */
+  /* —— 界面语言下拉 —— */
+  const ls = $('#c-lang');
+  if(ls && d.languages && !ls.dataset.filled){
+    ls.dataset.filled = '1';
+    const readySet = new Set(d.ui_language_ready || []);
+    d.languages.forEach(L => {
+      const o = document.createElement('option');
+      o.value = L.code; o.textContent = L.native;
+      if(!readySet.has(L.code)) o.textContent += T.cfg_lang_untranslated;
+      if(L.code === (d.ui_language || 'zh')) o.selected = true;
+      ls.appendChild(o);
+    });
+  }
   confKeys = d.keys || {};
   const bs = $('#c-brand');
   if(bs && d.brands && !bs.dataset.filled){
@@ -9440,7 +10550,7 @@ function fillConf(d){
       bs.appendChild(o);
     });
     const oc = document.createElement('option');
-    oc.value = '__custom__'; oc.textContent = '自定义…'; oc.dataset.url = '';
+    oc.value = '__custom__'; oc.textContent = T.cfg_custom; oc.dataset.url = '';
     bs.appendChild(oc);
   }
   if(bs){
@@ -9453,11 +10563,11 @@ function fillConf(d){
   }
   /* Key 输入框：只说当前品牌存过没有，不预填（留空即不变） */
   $('#c-key').value = '';
-  $('#c-key').placeholder = 'sk-…（留空则不变）';
+  $('#c-key').placeholder = T.cfg_key_ph;
   showKeyState();
   const ms = $('#c-modelst');
   if(ms && !ms.textContent) ms.textContent = localModels.length
-    ? ('本地模型在线：' + localModels.join('、') + '，选中会自动指向 ' + localUrl)
+    ? (T.cfg_local_online_a + localModels.join('、') + T.cfg_local_online_b + localUrl)
     : '';
 }
 /* 当前品牌已存的 Key 摘要（后端 keys 是掩码，不是明文） */
@@ -9466,10 +10576,10 @@ function curBrand(){ const b = $('#c-brand'); return b ? b.value : ''; }
 function showKeyState(){
   const t = $('#c-keyst'); if(!t) return;
   const nm = curBrand();
-  if(nm === '__custom__'){ t.textContent = '自定义接口：Key 按接口地址单独记'; return; }
+  if(nm === '__custom__'){ t.textContent = T.cfg_custom_note; return; }
   const k = confKeys[nm];
-  t.innerHTML = k ? ('该品牌已存 Key：<em>' + k + '</em>，留空即保持不变')
-                  : '该品牌还没存过 Key，填一次即记住';
+  t.innerHTML = k ? (T.cfg_key_stored_a + '<em>' + k + '</em>' + T.cfg_key_stored_b)
+                  : T.cfg_key_none;
 }
 /* 品牌 → 自动填地址 */
 $('#c-brand') && ($('#c-brand').onchange = () => {
@@ -9478,24 +10588,24 @@ $('#c-brand') && ($('#c-brand').onchange = () => {
   if(u){ $('#c-base').value = u; }
   showKeyState();
   const ms = $('#c-modelst'); if(ms) ms.textContent = '';
-  const bl = $('#c-bal'); if(bl) bl.textContent = '点「查询」看剩余额度';
+  const bl = $('#c-bal'); if(bl) bl.textContent = T.cfg_balance_tip;
   confModels(curBrand(), []);
 });
 /* 拉模型 / 查余额 的发起 */
 function confAsk(extra){
   const base = ($('#c-base').value || '').trim();
-  if(!base){ toast('先填接口地址（或选一个品牌）'); return false; }
+  if(!base){ toast(T.cfg_need_base); return false; }
   wsSend(Object.assign({base_url: base, api_key: ($('#c-key').value || '').trim(),
                         brand: curBrand()}, extra));
   return true;
 }
 $('#c-pull') && ($('#c-pull').onclick = () => {
   if(!confAsk({cmd:'probe_models'})) return;
-  $('#c-modelst').textContent = '正在拉取模型…';
+  $('#c-modelst').textContent = T.cfg_fetching_models;
 });
 $('#c-balbtn') && ($('#c-balbtn').onclick = () => {
   if(!confAsk({cmd:'get_balance'})) return;
-  $('#c-bal').textContent = '正在查询…';
+  $('#c-bal').textContent = T.cfg_querying;
 });
 /* 后端 events：models / balance */
 function confModels(brand, list){
@@ -9506,33 +10616,33 @@ function confModels(brand, list){
     const o = document.createElement('option'); o.value = m; o.textContent = m;
     sel.appendChild(o);
   });
-  const o2 = document.createElement('option'); o2.value = '__custom__'; o2.textContent = '自定义…';
+  const o2 = document.createElement('option'); o2.value = '__custom__'; o2.textContent = T.cfg_custom;
   sel.appendChild(o2);
   sel.value = (list.indexOf(keep) >= 0) ? keep : list[0];
 }
 function onModels(d){
   const ms = $('#c-modelst');
-  if(!d.ok){ if(ms) ms.textContent = '拉取失败：' + (d.error || '未知原因'); return; }
+  if(!d.ok){ if(ms) ms.textContent = T.cfg_fetch_fail + (d.error || T.cfg_unknown); return; }
   confModels(d.brand || curBrand(), d.models || []);
   if(!ms) return;
   if(d.source === 'builtin'){
-    ms.textContent = '这个后端没有 /models 接口，列出的是内置清单（' + (d.models || []).length + ' 个），仅供参考';
+    ms.textContent = T.cfg_no_models + (d.models || []).length + T.cfg_no_models_mid;
   } else {
-    ms.textContent = '已拉到 ' + (d.models || []).length + ' 个模型，选中后点「保存」生效';
+    ms.textContent = T.cfg_fetched + (d.models || []).length + T.cfg_fetched_n;
   }
 }
 function onBalance(d){
   const el = $('#c-bal'); if(!el) return;
-  if(!d.ok){ el.textContent = d.error || '查询失败'; return; }
+  if(!d.ok){ el.textContent = d.error || T.cfg_query_fail; return; }
   const b = d.balance || {};
   if(b.kind === 'money'){
     const cur = b.currency === 'USD' ? '$' : 'Y';
-    el.innerHTML = '余额 <em>' + cur + ' ' + b.total + '</em>'
-      + '（充值 ' + b.topped + ' + 赠送 ' + b.granted + '）';
+    el.innerHTML = T.cfg_balance + ' <em>' + cur + ' ' + b.total + '</em>'
+      + T.cfg_balance_money_a + b.topped + T.cfg_balance_money_b + b.granted + T.cfg_balance_money_c;
   } else if(b.kind === 'credit'){
-    el.innerHTML = '本机累计消耗 <em>' + b.used + '</em> 点' + (b.note ? ' · ' + b.note : '');
+    el.innerHTML = T.cfg_used_local + ' <em>' + b.used + '</em> ' + T.cfg_points + (b.note ? ' · ' + b.note : '');
   } else {
-    el.textContent = b.note || '该服务商未提供余额接口';
+    el.textContent = b.note || T.cfg_no_balance_api;
   }
 }
 
@@ -9657,8 +10767,8 @@ function renderEvoCaps(d){
   const tip = $('#p-caps-tip');
   box.style.display = '';                  /* 常驻显示：不再"点一次才出来" */
   if(!items.length){
-    box.innerHTML = '<span class="cap" style="border-style:dashed">正在让 AI 研究今天的方向…</span>';
-    if(tip) tip.textContent = '每天由 AI 自动换一批；点一颗即可锁定它';
+    box.innerHTML = '<span class="cap" style="border-style:dashed">' + T.evo_ai_picking + '</span>';
+    if(tip) tip.textContent = T.evo_dir_hint;
     wsSend({cmd:'evolve_suggest'});        /* 空就再要一次（服务端当天已有会秒回） */
     return;
   }
@@ -9704,6 +10814,8 @@ $('#c-save').onclick = () => {
   const o = {cmd:'save_config', shell_access: $('#c-shell').checked};
   if(uiDirty && uiVals){ o.ui = Object.assign({}, uiVals); uiSaving = true; }   /* 外观改动一并落盘；uiSaving 让回执能正常收口 */
   if(curBrand() && curBrand() !== '__custom__') o.brand = curBrand();
+  const langSel = $('#c-lang');
+  if(langSel && langSel.value){ o.ui_language = langSel.value; langChanged = (langSel.value !== curUiLang); }
   let model = v, base = $('#c-base').value.trim();
   if(v.indexOf('local::') === 0){          /* 本地模型：地址固定指向本机 */
     model = v.slice(7);
@@ -9722,6 +10834,15 @@ $('#c-save').onclick = () => {
     toast('已切到 ' + model + '（云端接口地址与 Key 已保留，随时可再切回本地）', 5000);
   }
   setTimeout(() => { $('#conf').style.display = 'none'; }, 700);
+  /* 语言改了 → 静态界面文案由服务端注入，必须重新拉一次 HTML 才生效。
+     这会重连 WS（会话内容不受影响，服务端按 sid 恢复）。 */
+  if(langChanged){
+    setTimeout(() => {
+      toast(T.reload_for_lang === 'reload_for_lang'
+              ? '正在切换语言，页面将重新加载…' : T.reload_for_lang, 4000);
+      setTimeout(() => location.reload(), 500);
+    }, 800);
+  }
 };
 
 /* ------------- 会话内搜索（Ctrl+F，像 codex 那样在对话里找） ------------- */
@@ -9765,7 +10886,7 @@ function runFind(q){
     const b = t.querySelector('.bub');
     if(b && b.textContent.toLowerCase().indexOf(w) >= 0) findHits.push(t);
   });
-  if(!findHits.length){ $('#findinfo').textContent = '无结果'; return; }
+  if(!findHits.length){ $('#findinfo').textContent = T.find_none; return; }
   findIdx = 0; gotoHit();
 }
 function gotoHit(){
@@ -9836,7 +10957,7 @@ function cmdpOpen(){ const b = $('#cmdp'); return !!b && b.style.display !== 'no
 function hideCmdp(){ const b = $('#cmdp'); if(b) b.style.display = 'none'; }
 function renderCmdp(){
   const b = $('#cmdp');
-  b.innerHTML = '<div class="hd">↑↓ 选择 · Enter 执行 · Tab 补全 · Esc 关闭</div>'
+  b.innerHTML = '<div class="hd">' + T.slash_hint + '</div>'
     + cmdShown.map((c, i) =>
         `<div class="ci${i === cmdSel ? ' sel' : ''}" data-i="${i}">`
         + `<span class="c">${esc(c.c)}</span><span class="d">${esc(c.d)}</span></div>`).join('');
@@ -9877,7 +10998,7 @@ function fileQuery(){                     /* 光标前最近的 @xxx，且 @ 前
 }
 function renderFilep(){
   const b = $('#filep');
-  b.innerHTML = '<div class="hd">@ 引用文件 · ↑↓ 选择 · Enter 插入 · Esc 关闭</div>'
+  b.innerHTML = '<div class="hd">' + T.at_hint + '</div>'
     + fileShown.map((f, i) => {
         const cut = f.lastIndexOf('/');
         const name = cut >= 0 ? f.slice(cut + 1) : f;
@@ -9961,6 +11082,7 @@ input.addEventListener('keydown', e => {
 send.onclick = submit;
 
 /* ---------------- 启动 ---------------- */
+applyI18N();                    /* 先把静态文案按当前界面语言换掉，再做其它渲染 */
 pqLoad(); renderPending(); refreshSend(); initFind();
 
 /* ---------------- 任务状态看门狗 ----------------
@@ -9999,7 +11121,7 @@ document.addEventListener('visibilitychange', () => {
   document.head.appendChild(st);
   const box = document.createElement('div'); box.className = 'sfind';
   const el = document.createElement('input');
-  el.type = 'text'; el.id = 'sfind'; el.autocomplete = 'off'; el.placeholder = '搜索对话…';
+  el.type = 'text'; el.id = 'sfind'; el.autocomplete = 'off'; el.placeholder = T.sess_search_ph;
   box.appendChild(el);
   listEl.parentNode.insertBefore(box, listEl);
   const orig = renderSessions;
@@ -10015,7 +11137,7 @@ document.addEventListener('visibilitychange', () => {
     c.archived = (d.archived || []).filter(hit);
     if(!c.sessions.length && !c.archived.length){
       lastSess = d;
-      listEl.innerHTML = '<div class="grp">没有匹配「' + esc(q) + '」的对话</div>';
+      listEl.innerHTML = '<div class="grp">' + T.sess_no_match_a + esc(q) + T.sess_no_match_b + '</div>';
       return;
     }
     orig(c);
@@ -10084,6 +11206,32 @@ setInterval(function(){
 </body>
 </html>
 """
+
+
+def render_web_html(lang: str | None = None) -> str:
+    """把语言包注入 WEB_HTML 再返回。
+
+    前端通过全局 T 对象取词：T.in_send → "Send"。
+    未翻译的键回落中文，最终回落键名本身（与后端 t() 行为一致）。
+    """
+    lc = lang or globals().get("UI_LANG") or "zh"
+    if lc not in I18N_BUILD:
+        lc = "zh"
+    # 中文作为兜底一起下发：某条英文缺失时前端能立刻回落，不必再问服务端
+    payload = {
+        "lang": lc,
+        "dir": (I18N_BUILD.get("meta", {}).get(lc) or {}).get("dir", "ltr"),
+        "dict": dict(I18N_BUILD.get("zh") or {}),
+        "meta": I18N_BUILD.get("meta") or {},
+    }
+    payload["dict"].update(I18N_BUILD.get(lc) or {})
+    js = (
+        "<script>window.__I18N__ = "
+        + json.dumps(payload, ensure_ascii=False)
+        + ";</script>\n</head>"
+    )
+    return WEB_HTML.replace("</head>", js, 1)
+
 
 SW_JS = "self.addEventListener('fetch', function(){});"
 MANIFEST = {
@@ -10356,6 +11504,11 @@ def config_payload(cfg: dict) -> dict:
         # ---- 设置页重构：品牌 / 各品牌已存 Key / 工作目录 ----
         "brands": [{"name": n, "base_url": u} for n, u in PROVIDER_PRESETS],
         "brand": cfg.get("provider") or (provider_of_model(cfg, cfg.get("model"))[0] or ""),
+        # ---- 界面多语言 ----
+        "ui_language": detect_ui_lang(cfg),
+        "languages": [{"code": c, "native": (m or {}).get("native", c)}
+                      for c, m in (I18N_BUILD.get("meta") or {}).items()],
+        "ui_language_ready": [c for c, tbl in I18N_BUILD.items() if tbl and c != "meta"],
         "keys": all_provider_keys(cfg),
         "wb_credit_used": float(cfg.get("wb_credit_used") or 0),
         "ui": get_appearance(cfg),
@@ -11205,16 +12358,36 @@ def write_resume_note_if_interrupted() -> str:
             return ""
         last = msgs[-1]
         role = str(last.get("role") or "")
+        _en = str(globals().get("UI_LANG") or "zh").lower().startswith("en")
         if role == "tool":
-            why = "上一轮停在一个工具刚跑完、还没生成回复的地方"
+            why = ("The previous turn stopped right after a tool finished, before a reply "
+                   "was generated" if _en else "上一轮停在一个工具刚跑完、还没生成回复的地方")
         elif role == "assistant" and last.get("tool_calls"):
-            why = "上一轮刚发出工具调用就被掐断了"
+            why = ("The previous turn was cut off right after it sent a tool call"
+                   if _en else "上一轮刚发出工具调用就被掐断了")
         elif role == "assistant" and not str(last.get("content") or "").strip():
-            why = "上一轮的回复是空的（多半被重启打断）"
+            why = ("The previous turn's reply was empty (most likely interrupted by a restart)"
+                   if _en else "上一轮的回复是空的（多半被重启打断）")
         elif role == "user":
-            why = "有一条消息还没被处理"
+            why = ("There is a message that was never processed"
+                   if _en else "有一条消息还没被处理")
         else:
             return ""
+        if _en:
+            (APP_DIR / "_resume.md").write_text(
+                why + ", so the service was restarted/interrupted rather than finishing "
+                "normally.\n"
+                "First check the unchecked items in [the current task list], then review "
+                "the last few turns and carry the unfinished work through; if it is in fact "
+                "already done, just give a brief wrap-up.\n"
+                "(This marker was generated by the startup self-check and is cleared once "
+                "used.)",
+                encoding="utf-8")
+            return (why + "; the service was restarted/interrupted, not finished normally. "
+                    "First check the unchecked items in [the current task list], then "
+                    "review the last few turns and carry the unfinished work through; if it "
+                    "is already done, just give a brief wrap-up. "
+                    "(Startup self-check marker; cleared once used.)")
         (APP_DIR / "_resume.md").write_text(
             why + "，说明服务是被重启/打断的，不是正常收尾。\n"
             "请先看【当前任务清单】里没打勾的项，再回看最近几轮对话，"
@@ -12025,6 +13198,11 @@ def cmd_web(cfg: dict, args) -> int:
                     _set("api_key", sk); changed.append("Key")   # 本地不写占位 Key
                 if "shell_access" in msg:
                     _set("shell_access", bool(msg["shell_access"])); changed.append("权限")
+                ul = str(msg.get("ui_language") or "").strip()
+                if ul and ul in I18N_BUILD:
+                    _set("ui_language", ul)
+                    globals()["UI_LANG"] = ul
+                    changed.append("语言")
                 if isinstance(msg.get("ui"), dict):
                     # 外观：与 config.json 里已存的值合并后夹取合法范围
                     ui = dict(get_appearance(cfg))
@@ -12181,7 +13359,7 @@ def cmd_web(cfg: dict, args) -> int:
                 self._ws_loop(state, cfg)
                 return
             if path in ("/", "/index.html"):
-                self._send(200, WEB_HTML, "text/html; charset=utf-8")
+                self._send(200, render_web_html(), "text/html; charset=utf-8")
             elif path == "/manifest.webmanifest":
                 self._send(200, json.dumps(MANIFEST, ensure_ascii=False),
                            "application/manifest+json; charset=utf-8")
@@ -13102,6 +14280,8 @@ def main() -> int:
     for k, v in flags.items():
         setattr(args, k, v)
     cfg = load_config()
+    # 界面语言：启动时定一次，之后由设置页保存时改（见 save_config 处理）
+    globals()["UI_LANG"] = detect_ui_lang(cfg)
 
     if args.cmd == "config":
         return cmd_config(cfg, args)
