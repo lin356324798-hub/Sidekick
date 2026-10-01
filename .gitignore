@@ -1,0 +1,22 @@
+# 运行时数据（绝不入库）
+config.json
+github.json
+hdc_key.json
+hdc_target.json
+sessions/
+memory.md
+memory.md.bak-*
+uploads/
+outputs/
+logs/
+versions/
+tmp/
+__pycache__/
+*.pyc
+*.log
+*.pid
+access.log
+turn.log
+eval_q.txt
+eval_r.txt
+last-good.py
