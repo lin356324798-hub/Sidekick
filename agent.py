@@ -55,10 +55,104 @@ def _getaddrinfo_v4(host, port, family=0, type=0, proto=0, flags=0):
 
 socket.getaddrinfo = _getaddrinfo_v4
 
-VERSION = "1.7.4"
+VERSION = "1.8.5"
 # 本进程的启动标识：服务重启后会变，前端据此判断"我手上的页面代码过期了"并自动重载
 BOOT_ID = datetime.now().strftime("%Y%m%d%H%M%S")
-APP_DIR = Path.home() / ".termux-agent"
+
+
+def _write_text_atomic(path, text: str, encoding: str = "utf-8", mode: int = None) -> None:
+    """原子写文本：先写同目录临时文件并 fsync，再 os.replace 覆盖目标。
+
+    为什么必须这样：sessions/*.json、config.json 这类文件是"边跑边整份重写"的，
+    直接 write_text 是「先截断、再写」——写一半被系统杀进程（安卓上常见）就留下
+    半截 JSON，下次启动读不动，表现为"会话记录凭空消失"。os.replace 在同一文件
+    系统内是原子的：要么旧内容、要么新内容，不会出现第三种。
+    """
+    p = Path(path)
+    tmp = p.with_name(f".{p.name}.tmp")
+    with open(tmp, "w", encoding=encoding) as f:
+        f.write(text)
+        f.flush()
+        try:
+            os.fsync(f.fileno())      # 先落盘再换名，防断电只拿到目录项
+        except Exception:
+            pass                      # 某些 fs 不支持 fsync，忽略即可
+    if mode is not None:
+        try:
+            os.chmod(tmp, mode)
+        except Exception:
+            pass
+    os.replace(tmp, p)
+
+
+def _check_dup_defs() -> list:
+    """扫本文件顶层的重复 def/class，返回 [(名字, 行号列表)]。
+
+    由来：当天出现过一次「自己改自己」时新代码插错位置、旧函数没删干净，于是同名
+    函数被定义了两次，Python 静默取最后一个 —— 老代码继续跑，看代码却是新的，
+    排查半天。这里在启动时只看函数/类定义行，纯文本扫，零副作用。
+
+    误报排除：有意覆盖是合法写法——先 `_old = tool_x` 留住旧实现，再重定义
+    `def tool_x` 包一层兜底（本文件的 tool_fetch_url 就是这么干的）。所以
+    只要某个名字的首次定义之后、下一次定义之前，出现过把这个名字赋给别的变量
+    （`xxx = 名字`）的行，就不算异常。
+    """
+    seen, dups = {}, []
+    try:
+        src = Path(__file__).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    lines_src = src.splitlines()
+    for i, line in enumerate(lines_src, 1):
+        m = re.match(r"(?:def|class)\s+([A-Za-z_]\w*)\s*[(:\[]", line)
+        if m:
+            seen.setdefault(m.group(1), []).append(i)
+    for name, lines in seen.items():
+        if len(lines) < 2:
+            continue
+        # 检查相邻两次定义之间，是否把该名字别名给了别处（`_x = name`）
+        # 注意行号是 1-based，lines_src 是 0-based：第 n 行 → lines_src[n-1]
+        intentionally_overridden = False
+        for a, b in zip(lines, lines[1:]):
+            for mid in lines_src[a:b - 1]:          # 行号 a+1 .. b-1（不含两端）
+                if re.match(rf"\s*[A-Za-z_]\w*\s*=\s*{re.escape(name)}\s*(?:#.*)?$", mid):
+                    intentionally_overridden = True
+                    break
+            if intentionally_overridden:
+                break
+        if not intentionally_overridden:
+            dups.append((name, lines))
+    return dups
+# ---- 平台抽象层（2026-10-01 引入，v4）---------------------------------------
+# 把一切平台差异（路径 / shell / 杀进程 / 后台启动 / 工具可用性 / 提示词）
+# 收敛到同目录的 platform_layer.py，本文件不再直接判断平台。
+# Termux/Linux/macOS 仍用 ~/.termux-agent；Windows 用 %USERPROFILE%\.sidekick。
+# 该模块缺失时下面直接退回原有行为，所以即便平台层丢了也不会起不来。
+# v2 补齐了首次遗漏的三处真实调用：_kill_proc 走 kill_tree、
+# _exec_stream 与 tool_bash 的启动参数走 shell_args / detach_kwargs。
+# v3（第二期）看门狗跨平台化：POSIX 继续用经过验证的内嵌 bash 版（本机零回归），
+# 没有 bash 的平台（Windows）改用随包分发的 supervisor_py.py（纯标准库，
+# 逐条等价实现：单实例保护 / 健康检查 / 宽限期 / 语法回滚 / 重启 / 连续失败回滚）。
+# v4 修掉 supervisor.pid 被误删的缺陷：_stop_server 只在确认看门狗真的死了之后
+# 才删 pid 文件（原先无条件删，kill 失败时会让下一个看门狗误判并抢占，
+# 导致两个看门狗互相抢杀服务）；同时移除服务退出时那段永不成立的清理死代码。
+try:
+    from platform_layer import (
+        app_dir as _pl_app_dir, shell_path as _pl_shell_path,
+        kill_tree as _pl_kill_tree, shell_args as _pl_shell_args,
+        detach_kwargs as _pl_detach_kwargs, PLATFORM_NAME as _PLATFORM_NAME,
+        platform_note as _pl_platform_note,
+        tool_available as _pl_tool_available,
+        python_exe as _pl_python_exe,
+    )
+    APP_DIR = _pl_app_dir()
+except Exception:                       # 平台层缺失时退回原行为，绝不因此起不来
+    _pl_shell_path = _pl_kill_tree = _pl_shell_args = _pl_detach_kwargs = None
+    _pl_platform_note = None
+    _pl_tool_available = None
+    _pl_python_exe = None
+    _PLATFORM_NAME = "Android/Termux"
+    APP_DIR = Path.home() / ".termux-agent"
 CONFIG_PATH = APP_DIR / "config.json"
 SESSION_PATH = APP_DIR / "last-session.json"      # 兼容旧版；新会话存 sessions/ 目录
 SESSIONS_DIR = APP_DIR / "sessions"
@@ -354,6 +448,8 @@ def is_termux() -> bool:
 
 def termux_shell() -> str:
     """返回应当用来执行命令的 shell 路径。"""
+    if _pl_shell_path is not None:
+        return _pl_shell_path()
     if is_termux():
         for p in ("/data/data/com.termux/files/usr/bin/bash",
                   "/data/data/com.termux/files/usr/bin/sh"):
@@ -380,6 +476,89 @@ def save_memory(text: str) -> None:
         MEMORY_PATH.write_text(text, encoding="utf-8")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------- 教训馆（lessons/）
+# 2026-10-01 二期：把「教训」从 memory.md 里搬出来，改成**一条一个文件**。
+#
+# 为什么要搬：memory.md 是每轮都整段注入的（上限 MEMORY_MAX_CHARS），而【教训】是里面
+#   最大的一类（当晚 65 行里占 19 行、近三成）。它们常驻在那儿，一边把设备参数、偏好
+#   这类稳定事实往外挤（历史真丢过「系统更新被禁用」，导致用户点不了更新时谁都说不清），
+#   一边又只是干巴巴一行 —— 真要照着做还得重新翻上下文。
+# 搬进 lessons/ 之后：目录（scan_knowledge）只负责告诉模型"有哪些教训"，
+#   正文由模型按需 read_file 读取。这正是【约定】里的「知识归档分四馆」：
+#   skills / memory.md / lessons / 日志·会话。
+LESSONS_DIR = APP_DIR / "lessons"
+LESSON_TAG = "【教训】"
+LESSON_TITLE_CHARS = 40        # 文件内 H1 的长度上限
+
+
+def _lesson_title(body: str) -> str:
+    """给一条教训起个短标题：优先取第一句（句末标点截断），否则按字数截。"""
+    m = re.search(r"[。！？；]", body[:LESSON_TITLE_CHARS + 12])
+    if m and m.start() >= 8:
+        return body[:m.start()]
+    return body[:LESSON_TITLE_CHARS]
+
+
+def _lesson_stem(body: str, used: set) -> str:
+    """给一条教训取文件名：正文的 md5 前缀 —— 同一条教训每次算出同一个名字。
+
+    为什么必须稳定：scan_knowledge() 生成的目录会进 system prompt，而上游前缀缓存
+    要求从第 0 个 token 起逐字节一致。名字带随机值或时间戳的话，每轮目录都在变，缓存全废。
+    """
+    core = re.sub(r"\W+", "", body, flags=re.UNICODE)[:48] or body[:48]
+    base = "lesson-" + hashlib.md5(core.encode("utf-8")).hexdigest()[:8]
+    stem, n = base, 2
+    while stem in used:
+        stem = "%s-%d" % (base, n)
+        n += 1
+    return stem
+
+
+def append_lessons(lines: list) -> int:
+    """把新教训写成 lessons/<slug>.md（一条一个文件），返回实际写入条数。
+
+    只处理带 LESSON_TAG 开头的行 —— 不带标签的行一律忽略。
+    （调用方 merge_memory 已经先过滤过一遍，这里再挡一次是为了防呆：
+     万一以后有人把「整段提炼结果」直接传进来，也不会在 lessons/ 里生成垃圾文件。）
+
+    文件格式刻意写成「H1 **紧跟** 一行 `>` 引用」——
+    因为 _k_title_from_text 只认文档头部的标题块，而且**遇到空行就终止**：
+    H1 和引用行之间一旦有空行，抽出来的摘要就只剩光秃秃的标题。
+    """
+    if not lines:
+        return 0
+    try:
+        LESSONS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return 0
+    used, blob = set(), ""
+    for p in sorted(LESSONS_DIR.glob("*.md")):
+        used.add(p.stem)
+        try:
+            blob += p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    n = 0
+    for line in lines:
+        if not line.startswith(LESSON_TAG):
+            continue
+        body = line[len(LESSON_TAG):].strip()
+        if not body or body[:24] in blob:        # 空行 / 已经在 lessons/ 里了
+            continue
+        stem = _lesson_stem(body, used)
+        used.add(stem)
+        quote = body if len(body) <= 120 else body[:120]
+        try:
+            (LESSONS_DIR / (stem + ".md")).write_text(
+                "# %s\n> %s\n\n%s\n" % (_lesson_title(body), quote, body),
+                encoding="utf-8")
+            blob += body
+            n += 1
+        except Exception:
+            pass
+    return n
 
 
 _DRAFT_PREFIX = re.compile(
@@ -451,16 +630,69 @@ def merge_memory(new_items: str) -> None:
         added.append(line)
     if not added:
         return
+    # 教训分流：新教训写成 lessons/<slug>.md，不再堆进 memory.md。
+    # 不做这一步的话，拆分就是一次性的 —— 下一轮记忆提炼又会把教训塞回来，
+    # 把搬出去腾出的空间几轮就还回去了。
+    #
+    # 兜底：万一 lessons/ 连建都建不起来（磁盘/权限），就**退回老路径**让它们照旧进
+    # memory.md —— 宁可占点记忆额度，也不能把一条教训弄丢。
+    _lsn = [l for l in added if l.startswith(LESSON_TAG)]
+    if _lsn:
+        try:
+            LESSONS_DIR.mkdir(parents=True, exist_ok=True)
+            _dir_ok = True
+        except Exception:
+            _dir_ok = False
+        if _dir_ok:
+            _n = append_lessons(_lsn)
+            added = [l for l in added if not l.startswith(LESSON_TAG)]
+            if _n:
+                try:
+                    with open(APP_DIR / "evolve.log", "a", encoding="utf-8") as _ef:
+                        _ef.write("%s [记忆] %d 条新教训已写入 lessons/"
+                                  "（memory.md 不再累积教训）\n"
+                                  % (datetime.now().strftime("%Y-%m-%d %H:%M"), _n))
+                except Exception:
+                    pass
+        if not added:
+            return
     flow = flow + added
+    _dropped = []                     # 本次裁剪丢掉的条目，用于留痕
 
     def _size() -> int:
         return (sum(len(l) for l in stable) + sum(len(l) for l in flow)
                 + len(MEMORY_FLOW_MARK))
 
     while flow and _size() > MEMORY_MAX_CHARS:
-        flow.pop(0)                   # 先回收流水区最旧的
+        _dropped.append(("流水", flow.pop(0)))   # 先回收流水区最旧的
     while stable and _size() > MEMORY_MAX_CHARS:
-        stable.pop(0)                 # 实在放不下，才动稳定区
+        _dropped.append(("稳定", stable.pop(0)))  # 实在放不下，才动稳定区
+    # 留痕：pop(0) 是**静默丢弃** —— 丢掉的正是「系统更新被禁用」那类
+    # 事后谁都说不清的东西。写一行日志到 memory-trim.log，至少能查到
+    # 什么时候、丢了哪条、从哪个区丢的。（改动稳定区要格外刺眼地标出来。）
+    if _dropped:
+        try:
+            _st_hit = sum(1 for _z, _ in _dropped if _z == "稳定")
+            with open(APP_DIR / "memory-trim.log", "a", encoding="utf-8") as _tf:
+                _tf.write("%s 记忆超限裁剪：共丢 %d 条（稳定区 %d 条）"
+                          " 上限=%d 实际=%d\n"
+                          % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                             len(_dropped), _st_hit, MEMORY_MAX_CHARS, _size()))
+                for _z, _l in _dropped:
+                    _tf.write("    [%s] %s\n" % (_z, _l))
+        except Exception:
+            pass
+    # 同一次裁剪里稳定区被动了，说明记忆真的满了 —— 单独再记一笔到
+    # evolve.log，避免淹没在 memory-trim.log 的日常流水里。
+    if any(_z == "稳定" for _z, _ in _dropped):
+        try:
+            with open(APP_DIR / "evolve.log", "a", encoding="utf-8") as _ef:
+                _ef.write("%s [记忆] ⚠ 稳定区被裁剪（丢 %d 条），"
+                          "长期事实开始丢失，建议清理 memory.md 或提高上限\n"
+                          % (datetime.now().strftime("%Y-%m-%d %H:%M"),
+                             sum(1 for _z, _ in _dropped if _z == "稳定")))
+        except Exception:
+            pass
     save_memory("\n".join(stable + [MEMORY_FLOW_MARK] + flow))
 
 
@@ -759,7 +991,7 @@ def update_session_model(sid: str, model: str = "", base_url: str = "") -> None:
             d["model"] = model
         if base_url:
             d["base_url"] = base_url
-        p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        _write_text_atomic(p, json.dumps(d, ensure_ascii=False))
     except Exception:
         pass
 
@@ -775,7 +1007,7 @@ def rename_session(sid: str, title: str) -> bool:
             return False
         d = json.loads(p.read_text(encoding="utf-8"))
         d["title"] = (title or "").strip()[:40]
-        p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        _write_text_atomic(p, json.dumps(d, ensure_ascii=False))
         return True
     except Exception:
         return False
@@ -792,7 +1024,7 @@ def pin_session(sid: str, pinned: bool = True) -> bool:
             d["pinned"] = True
         else:
             d.pop("pinned", None)          # 取消时删字段，别攒一堆 false
-        p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        _write_text_atomic(p, json.dumps(d, ensure_ascii=False))
         return True
     except Exception:
         return False
@@ -826,7 +1058,7 @@ def save_session_messages(sid: str, messages: list, compress_ratio=None,
             data["model"] = model
         if base_url:
             data["base_url"] = base_url
-        _sess_path(sid).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        _write_text_atomic(_sess_path(sid), json.dumps(data, ensure_ascii=False))
     except Exception:
         pass
 
@@ -922,20 +1154,29 @@ KNOWN_MODELS = [
 
 
 def load_config() -> dict:
+    # 2026-10-01：配置从其它平台复制过来时，workdir 可能是对方的路径（如 C:\Users\x），
+    # 本机不存在会导致所有 shell 子进程起不来（cwd 无效）。这里兜底纠正。
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
             cfg.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
         except Exception as e:
             print(yellow(f"[!] 配置文件读取失败，使用默认值：{e}"))
-    # 环境变量优先级高于配置文件
+    # 环境变量优先级高于配置文件。
+    # 注意：这里只放本程序**专有**的 TERMUX_AGENT_* 变量。
     for env, key in (("TERMUX_AGENT_API_KEY", "api_key"),
-                     ("DEEPSEEK_API_KEY", "api_key"),
                      ("TERMUX_AGENT_MODEL", "model"),
                      ("TERMUX_AGENT_BASE_URL", "base_url"),
                      ("TERMUX_AGENT_WORKDIR", "workdir")):
         if os.environ.get(env):
             cfg[key] = os.environ[env]
+    # DEEPSEEK_API_KEY / OPENAI_API_KEY 这类名字是**行业通用**的，用户机器上常为别的工具设过。
+    # 早期版本无条件用它覆盖 api_key，会导致：拿 DeepSeek 的 key 去打别的服务商的接口
+    # （例如 base_url 指向 copilot.tencent.com），每轮请求都被拒（HTTP 504），
+    # 报错又只落在日志里，表现为"一发消息就中断"的哑巴故障。
+    # 判据必须是 base_url 而不是 model 名 —— model 可能叫 deepseek-xxx 但接口其实在别家。
+    if os.environ.get("DEEPSEEK_API_KEY") and "deepseek.com" in (cfg.get("base_url") or ""):
+        cfg["api_key"] = os.environ["DEEPSEEK_API_KEY"]
     if not cfg.get("workdir"):
         cfg["workdir"] = str(Path.home())
     return cfg
@@ -943,7 +1184,8 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     APP_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 原子写：config.json 存着 API Key，写一半被杀会留下半截 JSON 导致下次读不动
+    _write_text_atomic(CONFIG_PATH, json.dumps(cfg, ensure_ascii=False, indent=2))
     try:
         os.chmod(CONFIG_PATH, 0o600)   # 里面存着 API Key
     except Exception:
@@ -1017,6 +1259,127 @@ def _todo_rows(limit: int = 12) -> str:
                          for x in _its[:limit])
     except Exception:
         return ""
+
+
+# ------------------------------------------------------------------ 知识目录（「图书馆」）
+# 把散落各处的"文档库"统一成一份目录注入系统提示词：正文不进来，只告诉模型
+# 「有哪些文档、各自讲什么」，需要时让它自己 read_file 去读。
+#
+# 为什么这样做：system prompt 从第 0 个 token 起一致才能吃到上游前缀缓存
+# （见 build_system_prompt 上方注释）。目录必须逐字节稳定 —— 不许有时间戳、
+# 随机值、或在两次调用间变化的排序，否则缓存整段失效。
+KNOWLEDGE_SOURCES = [
+    # (馆名, 相对 APP_DIR 的目录, 说明, 单行标题上限)
+    ("", "skills", "本机沉淀的技能文档：踩过的坑、正确姿势、可复用流程。"
+                   "做相关任务前先用 read_file 读正文", 60),
+    # 2026-10-01 二期：把「教训」从 memory.md 搬出来单独成馆。
+    # 动机：memory.md 是**每轮都整段注入**的（上限 MEMORY_MAX_CHARS），而【教训】是里面
+    #   最大的一类（当晚 65 行里占 19 行、近三成）。它们常驻在那儿，一边把设备参数、偏好
+    #   这类稳定事实往外挤（历史真丢过「系统更新被禁用」，用户点不了更新时谁都说不清），
+    #   一边又只是干巴巴一行。搬进 lessons/ 后改由本目录按需 read_file 读正文。
+    # 上限给 100：教训的一句话说明本身就该把「什么坑 + 正确做法」讲完，压到 60 会截断。
+    ("教训", "lessons", "踩过的坑与正确做法（每条一个文件）。做相关任务前先 read_file 读正文", 100),
+]
+
+_BOILER = ("使用说明", "注意事项", "说明", "目录", "概述", "简介", "前言", "更新日志",
+           "changelog", "usage", "note", "notice", "overview", "introduction")
+
+
+def _k_title_from_text(txt: str, limit: int = 60, stem: str = "") -> str:
+    """从 Markdown 正文里抽一句"这文档讲什么"。
+
+    做法是**做减法**而不是堆启发式（2026-10-01 踩坑记录）：
+      · 只看文档头部的"标题块" —— 一级标题 + 紧跟的一行引用/加粗简介，遇空行后的
+        分节即停。这样表格分隔符 `|---|---|`、代码块、正文长句从一开始就进不来；
+      · 跳过与文件名相同的标题（`# doc-typeset` 这种等于没说）；
+      · 跳过长文档里那些"使用说明/注意事项"之类的套话标题。
+    实测 37 篇技能文档：这样抽出来的首个显著行 100% 是一级标题，零废话。
+    """
+    lines = [l.rstrip() for l in (txt or "").splitlines()]
+    head, quote = "", ""
+    for l in lines[:40]:
+        s = l.strip()
+        if not s:
+            # 已经拿到标题了，遇到空行就认为标题块结束
+            if head:
+                break
+            continue
+        if s.startswith("#"):                       # 标题行
+            lvl = len(s) - len(s.lstrip("#"))
+            t = s.lstrip("# ").strip().strip("*` ")
+            if not t:
+                continue
+            low = t.lower()
+            if lvl <= 1:
+                # 一级标题：与文件名同名就没信息量（很多文档直接拿文件名当标题）
+                if stem and (t == stem or t.lower() == stem.lower()
+                             or t.replace("-", " ").lower() == stem.replace("-", " ").lower()):
+                    continue
+                if not head:
+                    head = t
+            else:
+                # 二级及以下：套话标题不要（一级标题宽松，它最常见且通常就是文档真名）
+                if any(b in low for b in _BOILER):
+                    continue
+                if not head:
+                    head = t
+            continue
+        if not head:                                # 还没标题就先记下第一行非空正文
+            head = s.lstrip(">*`# ").strip()
+            continue
+        # 标题之后紧跟的引用/加粗行，通常是"一句话说明"，比标题本身有用
+        if not quote and (s.startswith(">") or s.startswith("**")):
+            q = s.lstrip("> ").strip()
+            q = q.strip("*").strip()                 # 去加粗标记
+            # 只在开头反引号与结尾反引号**配对**时才剥，避免把 `code` 的前引号吃掉
+            if q.startswith("`") and q.endswith("`") and len(q) > 1:
+                q = q[1:-1].strip()
+            quote = q
+        break
+    out = quote or head
+    if not out:
+        out = stem
+    return out[:limit]
+
+
+def _k_title(path: Path, limit: int = 60) -> str:
+    """读文件并抽一行摘要；读不到就退回文件名。"""
+    try:
+        return _k_title_from_text(path.read_text(encoding="utf-8", errors="replace"),
+                                  limit=limit, stem=path.stem)
+    except Exception:
+        return path.stem
+
+
+def scan_knowledge() -> str:
+    """扫 KNOWLEDGE_SOURCES 里各馆，生成注入用目录。无内容时返回空串。
+
+    输出形如（说明文案由各馆自己的 desc 决定，这里不硬编码，避免和 desc 重复）：
+        [馆名] 说明。路径 ~/.termux-agent/馆目录/名字.md：
+        - 条目名（一句话说明）
+        ...
+    """
+    blocks = []
+    for name, reldir, desc, limit in KNOWLEDGE_SOURCES:
+        # 用 APP_DIR 而不是 Path(__file__)：APP_DIR 是权威路径（平台层可覆盖），
+        # 且不依赖模块被 import 的方式（从别处 import 时 __file__ 会指错）。
+        d = APP_DIR / reldir
+        try:
+            if not d.is_dir():
+                continue
+        except Exception:
+            continue
+        rows = []
+        for f in sorted(d.glob("*.md")):          # 排序必须稳定，否则破坏前缀缓存
+            t = _k_title(f, limit=limit)
+            rows.append("- " + f.stem + (("（" + t + "）") if t and t != f.stem else ""))
+        if len(rows) < 2:
+            continue              # 只有一两条不值得占目录，直接告诉模型去读
+        head = ("[" + name + "] ") if name else ""
+        blocks.append(
+            "\n" + head + desc + "，路径 ~/.termux-agent/" + reldir + "/名字.md：\n"
+            + "\n".join(rows))
+    return "".join(blocks)
 
 
 def build_turn_context(cfg: dict, snap: dict):
@@ -1093,7 +1456,16 @@ def build_system_prompt(cfg: dict) -> str:
             "- 下载安装包/大文件：用 download 工具（流式保存、不截断、自动重试超时），"
             "  保存到 ~/storage/shared/Download/ 下，下载完告诉用户文件在哪。",
             "- 安装 APK：先用 download 下好 .apk，再用 sysshell 执行 `pm install -r 路径`（这是系统级安装，"
-            "  不需要确认）。安装失败多半是包不兼容或签名问题，把 pm 的报错原样告诉用户。",
+                "  不需要确认）。安装失败多半是包不兼容或签名问题，把 pm 的报错原样告诉用户。",
+        ]
+    elif _pl_platform_note is not None:
+        # 非 Termux 平台（Windows / macOS / Linux）：给一段通用的环境说明
+        env_lines += [
+            "关于这台设备的重要事实（请牢记，避免犯低级错误）：",
+            f"- {_pl_platform_note()}",
+            f"- 你的数据目录是 {APP_DIR}。",
+            "- 平台专有工具（hdcmate / wx_auto / sysshell）在本平台不可用，不要尝试调用。",
+            "- 设备资源有限时避免跑高内存任务；大输出要分页处理。",
         ]
         env_lines += [
             "关于你自己（你可以修改自己）：",
@@ -1121,25 +1493,12 @@ def build_system_prompt(cfg: dict) -> str:
         env_lines.append("\n[你对这位用户的长期记忆（对话中逐步积累，请默认采信，除非与新事实冲突）]\n" + mem)
     # 技能清单：skills/*.md 是沉淀下来的技能文档（踩过的坑、正确姿势）。
     # 这里只注入「有哪些技能」，具体内容让模型按需 read_file 去读，省上下文。
+    # 2026-10-01 重做（旧版只取第一个 # 开头的行，遇到 `# doc-typeset` 这种等于文件名的
+    #   标题就白给 —— 实测 37 篇里 20 篇摘要无信息量）；详见 scan_knowledge。
     try:
-        _sk = Path(__file__).resolve().parent / "skills"
-        if _sk.is_dir():
-            _rows = []
-            for _f in sorted(_sk.glob("*.md")):
-                _t = ""
-                try:
-                    for _l in _f.read_text(encoding="utf-8", errors="replace").splitlines():
-                        if _l.strip().startswith("#"):
-                            _t = _l.lstrip("# ").strip()
-                            break
-                except Exception:
-                    pass
-                _rows.append("- " + _f.stem + ("（" + _t + "）" if _t else ""))
-            if _rows:
-                env_lines.append(
-                    "\n[可用技能] 这些是本机沉淀的技能文档，做相关任务前先用 read_file 读它，"
-                    "里面记着踩过的坑和正确姿势（路径 ~/.termux-agent/skills/名字.md）：\n"
-                    + "\n".join(_rows))
+        _ki = scan_knowledge()
+        if _ki:
+            env_lines.append(_ki)
     except Exception:
         pass
     # 当前任务清单：todo.json 是落盘的，不受对话历史压缩影响，每轮都注入。
@@ -1239,6 +1598,15 @@ def build_system_prompt_en(cfg: dict) -> str:
             "`pm install -r <path>` via sysshell (a system-level install, no confirmation "
             "needed). Failures are usually incompatibility or a signature issue — relay "
             "pm's error message to the user verbatim.",
+        ]
+    elif _pl_platform_note is not None:
+        # Non-Termux platforms (Windows / macOS / Linux): generic environment notes
+        env_lines += [
+            "Important facts about this device (memorise them and avoid basic mistakes):",
+            f"- {_pl_platform_note()}",
+            f"- Your data directory is {APP_DIR}.",
+            "- Platform-specific tools (hdcmate / wx_auto / sysshell) are unavailable here; don't try to call them.",
+            "- Avoid high-memory jobs when resources are tight; page large output.",
         ]
         env_lines += [
             "About yourself (you can modify yourself):",
@@ -1842,6 +2210,9 @@ def _runtime():
 
 def _kill_proc(proc) -> None:
     """结束一个子进程：优先整组杀（命令里 fork 出来的子进程一起收掉）。"""
+    if _pl_kill_tree is not None:
+        _pl_kill_tree(proc)          # 平台层：POSIX 用 killpg，Windows 用 taskkill /F /T
+        return
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except Exception:
@@ -1864,11 +2235,13 @@ def _exec_stream(argv: list, cwd, timeout: int, rt=None) -> dict:
     返回 {out, rc, killed, error, elapsed}。error 非空表示连进程都没起来。
     """
     started = time.time()
+    # 平台层：POSIX 用 start_new_session，Windows 用 DETACHED_PROCESS；平台层缺失时退回旧行为
+    _dk = _pl_detach_kwargs() if _pl_detach_kwargs is not None else {"start_new_session": True}
     try:
         proc = subprocess.Popen(
             argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, text=True, errors="replace",
-            start_new_session=True, bufsize=1,
+            bufsize=1, **_dk,
         )
     except Exception as e:
         return {"out": "", "rc": None, "killed": "", "error": f"[错误] 无法启动命令: {e}",
@@ -1932,10 +2305,12 @@ def tool_bash(cfg, command: str, timeout_sec: int = 120, background: bool = Fals
             return f"[错误] 无法创建日志文件: {e}"
         try:
             with open(logp, "wb") as fh:
+                _bg_argv = _pl_shell_args(command) if _pl_shell_args is not None else [shell, "-lc", command]
+                _bg_kw = _pl_detach_kwargs() if _pl_detach_kwargs is not None else {"start_new_session": True}
                 proc = subprocess.Popen(
-                    [shell, "-lc", command],
+                    _bg_argv,
                     cwd=cfg["workdir"], stdout=fh, stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL, start_new_session=True,
+                    stdin=subprocess.DEVNULL, **_bg_kw,
                 )
         except Exception as e:
             return f"[错误] 无法在后台启动命令: {e}"
@@ -1945,7 +2320,8 @@ def tool_bash(cfg, command: str, timeout_sec: int = 120, background: bool = Fals
                 f"要停止就执行 `kill {proc.pid}`。\n"
                 f"注意：后台任务不会随本轮结束而停止，也不再受超时限制。")
 
-    r = _exec_stream([shell, "-lc", command], cfg["workdir"], timeout_sec, _runtime())
+    _argv = _pl_shell_args(command) if _pl_shell_args is not None else [shell, "-lc", command]
+    r = _exec_stream(_argv, cfg["workdir"], timeout_sec, _runtime())
     if r["error"]:
         return r["error"]
     out, rc, elapsed = r["out"], r["rc"], r["elapsed"]
@@ -3095,7 +3471,8 @@ def list_tools() -> list:
             desc = (fn.get("description") or "").strip()
             cut = desc.find("。")
             brief = desc[:cut] if cut > 0 else desc
-            out.append({"name": name, "brief": brief[:64], "full": desc[:900]})
+            out.append({"name": name, "label": TOOL_LABELS.get(name, ""),
+                        "brief": brief[:64], "full": desc[:900]})
     except Exception:
         pass
     return out
@@ -3703,7 +4080,7 @@ def send_notify(cfg, title, content, tag="termux_agent", url="", throttle=0) -> 
             if now - _NOTIFY_SEEN.get(tag, 0.0) < throttle:
                 return
             _NOTIFY_SEEN[tag] = now
-        title = re.sub(r"\s+", " ", str(title or "皮卡丘")).strip()[:50]
+        title = re.sub(r"\s+", " ", str(title or (cfg or {}).get("assistant_name") or "Sidekick")).strip()[:50]
         content = re.sub(r"\s+", " ", str(content or "")).strip()[:250] or "（无详情）"
 
         if not notify_api_ready():
@@ -4402,11 +4779,26 @@ def tool_selfupdate(cfg, summary: str = "", new_code: str = "",
     except Exception:
         pass
 
-    # 5) 几秒后重启服务加载新代码
+    # 5) 自我保护：重启前先 touch no-rollback，暂时禁止看门狗回滚。
+    #    原因（2026-10-01 血案）：看门狗原来健康检查连续失败 2 次就无条件回滚，
+    #    而 selfupdate 重启的瞬间必然有短暂空窗 —— 撞上就被当成"代码坏了"回滚掉。
+    #    实测 843 次回滚里只有 1 次是代码真有问题，其余 842 次是误杀，
+    #    连已经发布的新版本都被抹掉（v1.8.2 → v1.8.1）。
+    #    这里用"无条件的保险"换掉"凭运气不撞上"：marker 在服务成功起来后自动清除
+    #    （见 _clear_norollback_on_boot），真起不来时也由看门狗的 3 次重启兜底。
+    try:
+        (APP_DIR / "no-rollback").write_text(
+            "selfupdate %s 重启中，暂禁回滚\n%s" % (_now(), (summary or "")[:200]),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+    # 6) 几秒后重启服务加载新代码
     _restart_soon(delay=6, cfg=cfg)
     return (f"[成功] 已更新自身代码（{summary or '未说明改动'}）。"
-            "服务将在约 6 秒后自动重启加载新代码；如果新代码起不来，"
-            "看门狗会自动回滚到上一个可用版本。"
+            "服务将在约 6 秒后自动重启加载新代码；重启期间禁止自动回滚"
+            "（no-rollback 标记，服务成功启动后自动清除），"
+            "这样不会被看门狗误判回滚掉刚写的改动。"
             "请立刻结束本回合，不要再调用任何工具，直接向用户说明你改了什么。")
 
 
@@ -4581,7 +4973,7 @@ TOOL_SCHEMAS = [
         }, "required": []}}},
     {"type": "function", "function": {
         "name": "wx_auto",
-        "description": ("微信自动陪聊：读微信消息 / 自动回复指定联系人（用户已授权，对方知情）。"
+        "description": ("微信自动陪聊：读微信消息 / 自动回复老公（用户已授权，对方知情）。"
                         "action=read 只读屏（多模态看图），绝不发送；"
                         "once 体检：跑三道闸门并给人看判定结果；"
                         "run 后台启动自动回复（对方发新消息才回、已回过的不重复回）；"
@@ -4810,8 +5202,8 @@ TOOL_DESC_EN = {
             "timeout": "timeout in seconds, default 40",
         }},
     "wx_auto": {
-        "desc": ("Automated WeChat companion: read WeChat messages / auto-reply to a "
-                 "chosen contact (the user authorised this, and the other party knows). action=read "
+        "desc": ("Automated WeChat companion: read WeChat messages / auto-reply to the "
+                 "husband (the user authorised this, and the other party knows). action=read "
                  "only reads the screen (multimodal vision) and never sends; once runs a "
                  "check-up: three gates whose verdicts are shown to a human; run starts "
                  "auto-reply in the background (replies only to new incoming messages, and "
@@ -5063,6 +5455,7 @@ TOOL_LABELS = {
     "wx_auto": "微信陪聊",
     "hdcmate": "操控手机",
     "wps": "WPS 文档",
+    "imgedit": "图片处理",
 }
 
 
@@ -5317,6 +5710,9 @@ def build_tools(cfg: dict):
     out = []
     for t in TOOL_SCHEMAS:
         nm = t["function"]["name"]
+        # 平台专有工具：非对应平台直接不发（如 Windows 上没有 hdcmate/wx_auto/sysshell）
+        if _pl_tool_available is not None and not _pl_tool_available(nm):
+            continue
         if nm == "sysshell" and not cfg.get("shell_access"):
             continue
         if nm in off:
@@ -6680,7 +7076,7 @@ I18N_BUILD = {
         "chat_assistant": "助手",
         "chat_copy_msg": "复制这条消息",
         "chat_copy_reply": "复制这条回答",
-        "chat_continue": "继续",
+        "chat_continue": "已重启",
         "chat_find": "在对话里搜索（Ctrl+F）",
         "chat_find_ph": "在对话里搜索…",
         "chat_find_prev": "上一个（Shift+Enter）",
@@ -6937,7 +7333,7 @@ I18N_BUILD = {
         "chat_assistant": "Assistant",
         "chat_copy_msg": "Copy this message",
         "chat_copy_reply": "Copy this reply",
-        "chat_continue": "Continue",
+        "chat_continue": "Restarted",
         "chat_find": "Search in conversation (Ctrl+F)",
         "chat_find_ph": "Search in conversation…",
         "chat_find_prev": "Previous (Shift+Enter)",
@@ -7692,7 +8088,11 @@ svg.ic.fill{fill:currentColor;stroke:none}
    最先触发）。留出富余，外层就永远不滚。 */
 body .sheet .card{max-height:calc(100vh - 48px);max-height:calc(100dvh - 48px);
   display:flex;flex-direction:column;margin:0 auto}
-body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+/* 内容区改成 flex 纵向容器：这样 .pane.grow 上的 min-height:100% 才有参照 ——
+   block 子元素拿不到父级高度，只有父级是 flex 容器时子项才能被拉伸。
+   滚动照旧（overflow-y:auto 仍在），只是多了「子项可以撑满」这一条。 */
+body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;display:flex;flex-direction:column}
 /* 控制台卡片单独放宽（2026-10-01）：标签页涨到 9 个后，600px 装不下整条标签栏
    （标签本身约 596px + 容器左右 padding 24px = 620px），末位标签被挤出可视区。
    只放宽控制台，其他卡片（如技能详情）保持 600px 的舒适阅读宽度。 */
@@ -7738,6 +8138,30 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
 .log div{padding:3px 0;border-bottom:1px dashed var(--bd)}
 .log div:last-child{border-bottom:none}
 .log.chg{max-height:280px;font-size:12.5px}
+/* 「更新记录」「记忆」两页填满高度（2026-10-02）：
+   控制台卡片是定高的（防止切页时底部按钮跳动，见前面 .sheet#ctl .card 那段），
+   容器固定 531px，而这两页内容只有 350px / 261px，底下各空 180px / 270px。
+   定高本身不能动（一放按钮又会上下跳 447px），所以改成让这两页的内容自己长高、
+   把空白吃掉。做法：给这两个 pane 标记 .grow，把高度从 .card-b 一路传下来，
+   再让页内那块内容区 flex:1 撑满。
+   只加在 .grow 上，其他页（身份/上下文/日志）行为完全不变。 */
+.pane.grow.on{display:flex;flex-direction:column;min-height:100%}
+/* .row 原本是 align-items:center 的横排；改成 column 后，center 的含义变成
+   「交叉轴（横向）居中 + 宽度收缩到内容宽」——「记忆」页的 .ctl 因此只有 183px 宽，
+   看着就是「内容挤在中间一小条」（用户反馈的正是这个）。
+   stretch 让子元素横向撑满。 */
+.pane.grow.on>.row{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;align-items:stretch}
+/* .lb 原来是 flex:0 0 92px 的左侧标签，纵排后要独占一行、让出整行宽度 */
+.pane.grow.on>.row>.lb{flex:0 0 auto;width:100%}
+.pane.grow.on>.row>.ctl{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}
+.pane.grow.on>.row>.ctl>textarea{flex:1 1 auto;min-height:120px}
+/* 更新记录列表：撑满剩余空间，但**不能超过**容器 —— 超出部分自己在内部滚。
+   先前写成 max-height:none，实测列表长 913px 而容器只有 531px，外层内容区
+   被顶出滚动条（cardB.scrollHeight 987 > clientHeight 531），反倒破坏了
+   「底部按钮钉住」这个前提。改用 flex 分配：flex:1 + min-height:0 让浏览器
+   算出恰好可用的高度，max-height 交回给浏览器算，不使用固定值。 */
+.pane.grow.on .log.chg{flex:1 1 auto;min-height:120px}
+.pane.grow.on .log.chg{max-height:none}
 .log.chg .ci{margin:4px 0;padding:6px 9px;border-radius:var(--r-sm)}
 .log.chg .ci div{border-bottom:none;padding:0}
 .log.chg .m{color:var(--t4);font-size:12px}
@@ -7938,6 +8362,20 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           nm = nm.replace(/[\s\u3000]+/g, ' ').trim() || T.nav_settings;
           var pane = document.createElement('div');
           pane.className = 'pane'; pane.dataset.name = nm;
+          /* 记下这一页的多语言键（cfg_changelog / cfg_memory …）。下面给「更新记录」
+             「记忆」两页加 .grow 时按这个键判断，而不是按显示文字 —— 文字会随语言变，
+             键不会。（英文界面下标题是 Changelog/Memory，拿中文匹配就漏了。）
+
+             注意：有些标题把 data-t 写在**里面的 span 上**（如
+             `<div class="sec-t"><span data-t="cfg_changelog">更新记录</span>…</div>`），
+             只读 st 自身的属性会拿到空串、「更新记录」和「记忆」两页因此加不上 .grow。
+             所以读不到时回退到内部第一个带 data-t 的后代。 */
+          var _tk = (st.getAttribute && st.getAttribute('data-t')) || '';
+          if(!_tk && st.querySelector){
+            var _ts = st.querySelector('[data-t]');
+            if(_ts) _tk = _ts.getAttribute('data-t') || '';
+          }
+          pane.dataset.tkey = _tk;
           body.insertBefore(pane, st);
           var meta = null;
           Array.prototype.slice.call(st.children).forEach(function(ch){
@@ -7951,6 +8389,15 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           panes.push({name: nm, el: pane});
         });
         panes[0].el.classList.add('on');
+
+        /* 给「更新记录」「记忆」两页加 .grow：让它们的内容长高、吃掉底部空白。
+           为什么不直接去掉卡片定高：定高是为了让底部「立即压缩/保存」按钮不上下跳
+           （实测切页时位移曾达 447px，手指会按空），那个不能动。所以只让这两页
+           自己撑满。按 data-t 键判断，中文/英文界面都认。 */
+        panes.forEach(function(p){
+          var k = p.el.dataset.tkey || '';
+          if(k === 'cfg_changelog' || k === 'cfg_memory') p.el.classList.add('grow');
+        });
 
         /* ---------- ② 标签栏 ---------- */
         var tabs = document.getElementById('ctabs');
@@ -8300,7 +8747,10 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         (function wrapHandle(tries){
           if(typeof handleMsg !== 'function'){
             if(!tries) tries = 0;
-            if(tries < 100) setTimeout(function(){ wrapHandle(tries + 1); }, 60);
+            /* 等主逻辑那个 <script> 块跑完。跨 <script> 块没有 hoisting，
+               这里必然拿不到 handleMsg，只能轮询。窗口给足（600×100ms≈60 秒）：
+               页面变大后主逻辑可能要好几秒才跑到定义处，6 秒会漏掉。 */
+            if(tries < 600) setTimeout(function(){ wrapHandle(tries + 1); }, 100);
             return;
           }
           var prev = handleMsg;
@@ -8337,12 +8787,23 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
            让对话里的模型真正去分析并动手修 —— 而不是只在控制台里给一段诊断。
            注意本段脚本在主逻辑之前，input/send 那两个 const 还没初始化，
            所以这里一律用 getElementById 现取，不在闭包里引用它们。 */
+        /* 取文案：本段脚本排在主逻辑之前，那时 T 还没定义（const 暂时性死区），
+           直接写 T.xxx 会抛 ReferenceError 把整个 IIFE 打断、按钮插不进去。
+           这里必须走 window.__I18N__.dict 兜底（它在 <head> 里就先注入了）。 */
+        function _t(key, fallback){
+          try{
+            var d = (window.__I18N__ && window.__I18N__.dict) || {};
+            if(d[key] != null) return d[key];
+          }catch(e){}
+          try{ if(typeof T !== 'undefined' && T && T[key] != null) return T[key]; }catch(e){}
+          return fallback;
+        }
         (function(){
           var bar = document.getElementById('lg-load');
           if(!bar || !bar.parentNode) return;
           var fx = document.createElement('button');
           fx.type = 'button'; fx.className = 'btn pri';
-          fx.textContent = T.log_send_ai;
+          fx.textContent = _t('log_send_ai', '发给 AI 解决');
           fx.style.cssText = 'font-size:13px;padding:8px 14px';
           fx.onclick = function(){
             var nm = curName();
@@ -8352,7 +8813,8 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
             var inp = document.getElementById('input');
             var snd = document.getElementById('send');
             if(!inp || !snd){ toast('找不到输入框'); return; }
-            inp.value = T.log_pick_a + nm + T.log_pick_b
+            inp.value = _t('log_pick_a', '这是我从控制台「运行日志」里选的 ') + nm
+              + _t('log_pick_b', ' 的末尾内容，请先判断有没有问题，能直接修的就动手修，修不了说明原因：\n\n')
               + '```\n' + txt.slice(-8000) + '\n```';
             try{ inp.dispatchEvent(new Event('input')); }catch(e){}
             document.getElementById('ctl').style.display = 'none';   /* 收掉控制台，回到对话 */
@@ -8395,8 +8857,8 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           <button class="btn" id="tl-on" disabled>恢复选中</button>
         </div>
         <div class="tbwrap">
-          <table class="tb">
-            <thead><tr><th class="ck"></th><th data-t="th_tool">工具</th><th data-t="th_use">用途</th></tr></thead>
+          <table class="tb tl-tb">
+            <thead><tr><th class="ck"></th><th>名称</th><th data-t="th_use">用途</th></tr></thead>
             <tbody id="tl-list"></tbody>
           </table>
         </div>
@@ -8415,7 +8877,6 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
       .tbwrap .tb input[type=checkbox]{width:15px;height:15px;accent-color:var(--brand);cursor:pointer;
         vertical-align:middle;margin:0}
       .tbwrap .tb tr.disabled td:not(.ck){color:var(--t4);opacity:.6}
-      .tbwrap .tb tr.disabled td:first-of-type::after{content:'（已禁用）';font-weight:400;color:var(--t4);font-size:11px}
       </style>
       <style>
       .tbwrap{overflow-x:auto;-webkit-overflow-scrolling:touch}
@@ -8437,6 +8898,21 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
          （技能表的第 4、5 列）。实测：工具表 745→528px，横向滚动消失。 */
       .tbwrap .tb td:nth-child(3){white-space:normal;color:var(--t2);word-break:break-word}
       .tbwrap .tb td:nth-child(4),.tbwrap .tb td:nth-child(5){white-space:nowrap;color:var(--t4);font-size:11.5px}
+      /* 工具表只有 3 列（名称/用途，+勾选），上面那条 nth-child(4) 跟它无关；
+         但仍显式排掉，免得以后有人往工具表加第 4 列时又踩回「用途被 nowrap」。 */
+      .tbwrap .tl-tb td:nth-child(4){white-space:normal}
+      /* ---- 工具表（带 .tl-tb 类）：只有 3 列，宽度分配跟技能表完全不同 ----
+         上面那条 nth-child(4) 是给技能表的「大小」列用的（要 nowrap），
+         但工具表原先第 4 列是「用途」—— 被它按成 nowrap，长说明全挤成一行。
+         这里用类名把工具表摘出来，不再靠列序号去猜表意：
+           · 名称列：窄、单行、不可折 —— 中文名 + 下面一行等宽英文名；
+           · 用途列：吃掉剩下的全部宽度，正常折行。 */
+      .tbwrap .tl-tb td.tl-nm{white-space:nowrap;width:1%;color:var(--t1);font-weight:500}
+      .tbwrap .tl-tb .tl-name{display:block;line-height:1.35}
+      .tbwrap .tl-tb .tl-id{display:block;margin-top:2px;color:var(--t4);font-size:11px;line-height:1.2;
+                     font-family:ui-monospace,SFMono-Regular,monospace;font-weight:400}
+      .tbwrap .tl-tb td.tl-use{white-space:normal;word-break:break-word;color:var(--t2);line-height:1.55}
+      .tbwrap .tb tr.tlrow.disabled td:first-of-type::after{content:'（已禁用）';font-weight:400;color:var(--t4);font-size:11px}
       /* ---- 技能行：点一下展开 AI 说明，再点收回 ---- */
       .tbwrap tr.skrow{cursor:pointer}
       .tbwrap tr.skrow:hover td{background:var(--bg2)}
@@ -8485,10 +8961,16 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
           }).join('') : '<tr><td colspan="5">（还没有技能文档）</td></tr>';
           tlEl.innerHTML = tl.length ? tl.map(function(x){
             var dis = !!offSet[x.name];
-            return '<tr' + (dis ? ' class="disabled"' : '') + '>'
+            /* 名称列单行到底：中文名一行，英文名（等宽小字）紧跟其下。
+               英文名并进来是为了让「用途」独占剩下整行 —— 原先它被挤在
+               4 列里最窄的一格，还带着 nowrap，文字全挤成一团。 */
+            var nm = '<span class="tl-name">' + esc(x.label || '') + '</span>'
+                   + (x.label ? '<span class="tl-id">' + esc(x.name) + '</span>'
+                              : '<span class="tl-name">' + esc(x.name) + '</span>');
+            return '<tr class="tlrow' + (dis ? ' disabled' : '') + '">'
                  + '<td class="ck"><input type="checkbox" data-kind="tl" value="' + esc(x.name) + '"></td>'
-                 + '<td>' + esc(x.name) + '</td>'
-                 + '<td>' + esc(x.brief || '') + '</td></tr>';
+                 + '<td class="tl-nm">' + nm + '</td>'
+                 + '<td class="tl-use">' + esc(x.brief || '') + '</td></tr>';
           }).join('') : '<tr><td colspan="3">（读不到工具清单）</td></tr>';
 
           var n = document.getElementById('tl-n'); if(n) n.textContent = tl.length;
@@ -8638,7 +9120,8 @@ body .sheet .card-b{overflow-y:auto;flex:1 1 auto;min-height:0;overscroll-behavi
         (function wrapHandle(tries){
           if(typeof handleMsg !== 'function'){
             if(!tries) tries = 0;
-            if(tries < 100) setTimeout(function(){ wrapHandle(tries + 1); }, 60);
+            /* 同上：等主逻辑加载完再包，窗口给足避免事件被丢。 */
+            if(tries < 600) setTimeout(function(){ wrapHandle(tries + 1); }, 100);
             return;
           }
           var prev = handleMsg;
@@ -8873,7 +9356,14 @@ function sanitizeTags(src){
 }
 function render(src, depth){
   depth = depth || 0;
-  const codes = [], langs = [], cards = [];
+  /* 占位符数组必须跨递归层共享：卡片体是「再进一层 render()」渲染的，
+     如果每层各自新建 codes[]，外层的 \u0000C0\u0000 到了内层就查不到，
+     代码块会渲染成 <pre>undefined</pre>（卡片里放代码块必现）。
+     这里用第三参数把同一套数组传下去。 */
+  const _sh = arguments[2] || null;
+  const codes = _sh ? _sh.codes : [], langs = _sh ? _sh.langs : [];
+  const svgs  = _sh ? _sh.svgs  : [];
+  const cards = _sh ? _sh.cards : [];
   let s = String(src).replace(/```([\w#+-]*)\n?([\s\S]*?)```/g, (m,lg,c) => {
     codes.push(c.replace(/\n$/,'')); langs.push(lg || '');
     return '\u0000C' + (codes.length-1) + '\u0000';
@@ -8885,7 +9375,6 @@ function render(src, depth){
   const _lc = s.toLowerCase().lastIndexOf('</svg>');
   if(_lo > _lc) s = s.slice(0, _lo) + '\u0000P\u0000';
   /* 内联 SVG 整块先拿出来：它不能被逐行插 <br>，还必须保留大小写 */
-  const svgs = [];
   s = s.replace(/<svg\b[\s\S]*?<\/svg>/gi, m => {
     svgs.push(sanitizeSvg(m));
     return '\u0000S' + (svgs.length - 1) + '\u0000';
@@ -8940,7 +9429,7 @@ function render(src, depth){
       const cls = /^(card|tip|warn|danger)$/.test(cd.kind) ? cd.kind : 'card';
       out += '<div class="card ' + cls + '">'
            + (cd.title ? '<div class="card-h">' + cd.title + '</div>' : '')
-           + '<div class="card-b">' + render(cd.body, depth + 1) + '</div></div>';
+           + '<div class="card-b">' + render(cd.body, depth + 1, {codes:codes, langs:langs, svgs:svgs, cards:cards}) + '</div></div>';
       continue;
     }
     if(/^\s*\|.*\|\s*$/.test(ln)){ tbl.push(ln); continue; }
@@ -9658,10 +10147,10 @@ let inputHist = [], histIdx = -1;      /* ↑ / ↓ 翻自己发过的消息 */
 function submit(){
   let text = input.value.trim();
   const a = attach;
-  /* 空输入 + 没附件 → 直接发「继续」：
+  /* 空输入 + 没附件 → 直接发一句固定文案（取字典 chat_continue）：
      重启 / 中断之后不必再手打一遍，点一下发送就能接着做。 */
   if(!text && !a){
-    text = '继续';
+    text = T.chat_continue;
     input.value = ''; autoGrow(); hideFilep(); hideCmdp();
     if(streaming){ queueMsg(text); return; }
     sendText(text);
@@ -11631,6 +12120,22 @@ SUPERVISOR = APP_DIR / "supervisor.sh"
 VERSIONS_DIR = APP_DIR / "versions"
 LAST_GOOD = VERSIONS_DIR / "last-good.py"
 
+# ---- 看门狗脚本：按平台选（2026-10-01 跨平台改造第二期）--------------------
+# POSIX（Termux/Linux/macOS）继续用下面的 bash 版 SUPERVISOR_SH —— 它经过长期验证，
+# 本机零回归；Windows 没有 bash，也没有 pgrep/pkill/curl，改用随包分发的
+# supervisor_py.py（纯标准库，逐条等价实现了 bash 版的全部职责）。
+_HAVE_BASH = bool(shutil.which("bash"))
+if _HAVE_BASH:
+    SUPERVISOR = APP_DIR / "supervisor.sh"
+    SUPERVISOR_CODE = None          # None = 用内嵌的 bash 脚本
+else:
+    SUPERVISOR = APP_DIR / "supervisor.py"
+    _py_sup = Path(__file__).resolve().parent / "supervisor_py.py"
+    try:
+        SUPERVISOR_CODE = _py_sup.read_text(encoding="utf-8")
+    except Exception:
+        SUPERVISOR_CODE = None      # 读不到就退回 bash 版（哪怕平台没 bash，至少不崩）
+
 # 看门狗脚本：保证服务活着；代码被改坏时自动回滚到上一个可用版本。
 # 有了它，agent 才敢改自己的源码 —— 改崩了也能自己爬起来。
 SUPERVISOR_SH = r"""#!/data/data/com.termux/files/usr/bin/bash
@@ -11644,11 +12149,37 @@ PIDF="$APP_DIR/supervisor.pid"   # 看门狗专用。web.pid 归服务进程所�
                                   # 两边共用一个文件会互相覆盖，导致单实例保护失效、看门狗越堆越多。
 PY="$PREFIX/bin/python3"
 URL="http://127.0.0.1:8765/api/state"
+NOROLLBACK="$APP_DIR/no-rollback"   # 存在此文件 = 禁止回滚（自我改代码时先 touch 它）
+STABLE=12                           # 连续健康 12 次（约 60 秒）才认可当前版本为「可用版本」
+RF_LIMIT=3                          # 连续 3 次重启都没起来，才认定代码有问题
 
 mkdir -p "$VERS"
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 healthy() { curl -sf -o /dev/null --max-time 8 "$URL" >/dev/null 2>&1; }
+# alive() 必须精确判定，不能用 `pgrep -f "agent.py web --serve"`：
+#   pgrep -f 匹配的是**整条命令行文本**，于是「正在跑 pgrep/这条脚本/shell -c」
+#   这类命令行里含该串的进程全会被算成"服务还活着"，造成假阳性。
+#   实测：调用方命令行里写什么就匹配什么，连加 [a] 都挡不住（那只防书写者自匹配）。
+# 正确做法：拿 pid 后读 /proc/<pid>/cmdline，按 **argv 结构**判定 ——
+#   真服务必是 `python3 /path/agent.py web --serve`（argv[0] 解释器、argv[1] 是 agent.py），
+#   只做子串匹配会把 `bash -c '…agent.py web --serve…'` 也吞进来（踩过）。
+alive() {
+  local p a0 a1
+  for p in $(pgrep -f "agent.py web --serve" 2>/dev/null); do
+    [ "$p" = "$$" ] && continue
+    [ -r "/proc/$p/cmdline" ] || continue
+    a0=$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | sed -n '1p')
+    a1=$(tr '\0' '\n' < "/proc/$p/cmdline" 2>/dev/null | sed -n '2p')
+    case "$(basename "$a0")" in *python*) ;; *) continue ;; esac
+    case "$a1" in */agent.py|*\\agent.py) ;; *) continue ;; esac
+    return 0
+  done
+  return 1
+}
+ver_of() { grep -m1 -E '^VERSION *=' "$1" 2>/dev/null | tr -d '"' | awk '{print $3}'; }
+# 字节比较用 $PY 而不是 cmp/diff —— 这套要跑在各平台上，不假设 diffutils 装了
+same() { "$PY" -c 'import sys;sys.exit(0 if open(sys.argv[1],"rb").read()==open(sys.argv[2],"rb").read() else 1)' "$1" "$2" >/dev/null 2>&1; }
 
 # ---- 单实例保护：已经有活着的看门狗就退出，避免多个看门狗互相抢杀服务 ----
 OLD=$(cat "$PIDF" 2>/dev/null)
@@ -11661,31 +12192,48 @@ fi
 echo $$ > "$PIDF"
 
 log "看门狗启动 (pid $$)"
-fail=0
+fail=0        # 连续健康检查失败次数
+stable=0      # 连续健康次数（达到 STABLE 才认可当前源码为可用版本）
+rfail=0       # 连续「重启后仍起不来」次数 —— 这才是"代码真坏了"的唯一证据
 while true; do
   if healthy; then
     if [ "$fail" -gt 0 ]; then log "服务已恢复（此前连续失败 ${fail} 次）"; fi
-    fail=0; sleep 5; continue
+    fail=0; rfail=0
+    # ---- 稳定窗口：连续健康够久，才把当前源码认定为「可用版本」----
+    # 之前是重启后 1 秒就 cp "$SRC" "$GOOD" —— 服务还没证明自己就成了回滚目标。
+    # 一旦那个版本其实有问题，回滚就把坏版本恢复回来了（回滚目标被污染，
+    # 2026-10-01 那次 v1.8.2 的代码就是这么丢的）。
+    stable=$((stable+1))
+    if [ "$stable" -eq "$STABLE" ] && [ -f "$SRC" ] && ! same "$SRC" "$GOOD"; then
+      cp "$SRC" "$GOOD"
+      log "稳定运行约 $((STABLE*5)) 秒，记录 v$(ver_of "$SRC") 为可用版本"
+    fi
+    sleep 5; continue
   fi
 
-  # 健康检查失败：给服务宽限期，别误杀正在跑长任务的实例
-  # （识图/大文件处理这类活儿会让接口短暂变慢，8 秒超时 + 4 次宽限 ≈ 足够跑完）
-  # 关键：接口慢 ≠ 服务死了。长任务（大模型续跑 / 大文件处理）会把 GIL 占满，
-  # 导致 /api/state 连续超时 —— 这时主进程其实活得好好的，杀掉它等于腰斩任务，
-  # 而且重启后自愈又会续跑，形成"重启→续跑→误杀→重启"的死循环。
-  # 所以按进程存活来决定耐心：活着给 2 分钟，真没了就 1 次即重启（恢复更快）。
-  if pgrep -f "agent.py web --serve" >/dev/null 2>&1; then LIMIT=24; else LIMIT=1; fi
+  # ---- 健康检查失败 ----
+  # 关键教训：**「没有响应」不等于「代码坏了」。**
+  # 实测回滚 843 次，真的语法错误只有 1 次 —— 其余全是重启竞态：
+  #   本脚本 pkill 后起新实例，新实例发现 flock 还被垂死的老进程握着 → 自己退出
+  #   → 有一段谁都没在服务 → 健康检查失败 → 被误判成"服务异常"→ 回滚好代码。
+  # 还有一个更早的坑：原来看门狗刚启动时 pgrep 恰好没匹配到 → LIMIT=1 → 一次即判死。
+  # 所以耐心按「进程在不在」分档，且**都不再是 1 次即判死**：
+  #   进程活着 → 给 2 分钟（长任务会把接口拖慢，杀它等于腰斩任务）；
+  #   进程没了 → 也连续 6 次（约 30 秒），避开「重启脚本刚 pkill、新进程还没 exec」的窗口。
+  if alive; then LIMIT=24; else LIMIT=6; fi
   fail=$((fail+1))
   if [ "$fail" -lt "$LIMIT" ]; then
     log "健康检查失败（第 ${fail}/${LIMIT} 次），再观察"
     sleep 5
     continue
   fi
-  log "连续 ${fail} 次失败未恢复，判定服务异常，开始处理"
+  log "连续 ${fail} 次未恢复（进程$([ "$LIMIT" = 24 ] && echo 在 || echo 不在)），判定服务异常，开始处理"
 
-  # 语法坏了 → 立刻回滚
+  # ---- 语法真坏了 → 立即回滚（这是唯一可靠的回滚判据）----
   if ! "$PY" -m py_compile "$SRC" >>"$LOG" 2>&1; then
-    if [ -f "$GOOD" ]; then
+    if [ -f "$NOROLLBACK" ]; then
+      log "[警告] 语法检查失败，但存在 $NOROLLBACK，跳过回滚（请人工修复）"
+    elif [ -f "$GOOD" ]; then
       cp "$GOOD" "$SRC"
       log "语法检查失败，已回滚到上一个可用版本"
     else
@@ -11695,34 +12243,50 @@ while true; do
     continue
   fi
 
-  # 清掉可能残留的旧实例，再拉一个新的
-  pkill -f "agent.py web --serve" >/dev/null 2>&1
-  sleep 1
+  # ---- 清残留 + 拉起新实例 ----
+  # 必须先 pkill、再**等它真的退出**才启动：不等的话新实例会被垂死老进程的 flock
+  # 挡回去自己退出，留下"谁都没在服务"的空窗 —— 正是上面那种误判的来源。
+  # 用 [a] 写法：pkill -f 会匹配**执行 pkill 的那条命令自己**（命令行里含该串），
+  # 不加就会连自己一起杀，后面的启动命令根本跑不到（_restart.sh 那处就是这么栽的）。
+  pkill -f "[a]gent.py web --serve" >/dev/null 2>&1
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    alive || break
+    sleep 1
+  done
   log "启动服务"
   "$PY" "$SRC" web --serve >>"$LOG" 2>&1 &
 
   ok=0
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
     sleep 1
     if healthy; then ok=1; break; fi
   done
 
   if [ "$ok" = "1" ]; then
-    cp "$SRC" "$GOOD"
-    log "服务就绪，已记录可用版本"
-    fail=0
+    log "服务已就绪（${i} 秒），稳定 ${STABLE} 轮后再记录可用版本"
+    fail=0; rfail=0; stable=0
     sleep 3
   else
-    fail=$((fail+1))
-    log "健康检查失败（第 ${fail} 次）"
-    pkill -f "agent.py web --serve" >/dev/null 2>&1
-    sleep 2
-    if [ "$fail" -ge 2 ] && [ -f "$GOOD" ]; then
-      cp "$GOOD" "$SRC"
-      log "连续失败，已回滚到上一个可用版本"
-      fail=0
+    rfail=$((rfail+1))
+    log "重启后 ${i} 秒仍无响应（第 ${rfail}/${RF_LIMIT} 次）"
+    fail=0; stable=0
+    # 只有「反复重启都起不来」才怀疑代码；且当前源码与可用版本确实不同才值得回滚
+    # （相同就是空操作），并尊重 no-rollback 开关。回滚前把丢失的版本号喊出来。
+    if [ "$rfail" -ge "$RF_LIMIT" ] && [ -f "$GOOD" ]; then
+      if [ -f "$NOROLLBACK" ]; then
+        log "[警告] 连续 ${rfail} 次重启失败，但存在 $NOROLLBACK，跳过回滚"
+      elif same "$SRC" "$GOOD"; then
+        log "[注意] 连续 ${rfail} 次重启失败，但当前源码与可用版本相同 —— 回滚无意义，改查运行环境"
+      else
+        log "[警告] 连续 ${rfail} 次重启失败，回滚 v$(ver_of "$SRC") → v$(ver_of "$GOOD")（当前改动将丢失！）"
+        cp "$GOOD" "$SRC"
+        log "已回滚到上一个可用版本"
+      fi
+      rfail=0
     fi
-    sleep 3
+    # 同上：用 [a] 写法避免 pkill 匹配到执行它的那条命令自身
+    pkill -f "[a]gent.py web --serve" >/dev/null 2>&1
+    sleep 2
   fi
 done
 """
@@ -11732,11 +12296,36 @@ def ensure_supervisor() -> None:
     """把看门狗脚本写到磁盘（内容变化时更新）。"""
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
+        code = SUPERVISOR_CODE if SUPERVISOR_CODE is not None else SUPERVISOR_SH
         cur = SUPERVISOR.read_text(encoding="utf-8") if SUPERVISOR.exists() else ""
-        if cur != SUPERVISOR_SH:
-            SUPERVISOR.write_text(SUPERVISOR_SH, encoding="utf-8")
+        if cur != code:
+            SUPERVISOR.write_text(code, encoding="utf-8")
             os.chmod(SUPERVISOR, 0o700)
         VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _clear_norollback(reason: str = "") -> None:
+    """解除 selfupdate 留下的 no-rollback 保险（服务成功启动后调用）。
+
+    背景：selfupdate 改完代码、重启前会 touch no-rollback，让看门狗暂时别回滚；
+    等新代码证明自己能起来（绑上端口）就该撤掉，否则看门狗会永久失去回滚能力。
+
+    这里刻意容忍"标记不存在"（正常启动时本来就没有），也不抛异常 ——
+    它只是保险丝，任何情况下都不该影响服务启动。
+    """
+    try:
+        f = APP_DIR / "no-rollback"
+        if f.exists():
+            f.unlink()
+            try:
+                with open(APP_DIR / "evolve.log", "a", encoding="utf-8") as _fh:
+                    _fh.write("%s [回滚保护] 已解除 no-rollback（%s）\n"
+                              % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                 reason or "服务启动成功"))
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -11804,22 +12393,49 @@ def _open_url(url: str) -> None:
 
 def _stop_server() -> int:
     # 先停看门狗，否则它会把服务再次拉起来
+    sup_pid = 0
     try:
-        pid = int(WEB_PID.read_text().strip())
-        os.kill(pid, signal.SIGKILL)
-        print(green(f"  已停止看门狗（进程 {pid}）"))
+        sup_pid = int(WEB_PID.read_text().strip())
+        os.kill(sup_pid, signal.SIGKILL)
+        print(green(f"  已停止看门狗（进程 {sup_pid}）"))
     except Exception:
         print(dim("  看门狗已不在运行"))
+    # 只有确认看门狗真的死了才删 pid 文件。
+    # 之前是无条件 unlink —— 一旦 kill 失败（权限/时序）看门狗还活着、文件却没了，
+    # 下一个看门狗启动时读到空 PIDF，会以为「没有别的看门狗」直接抢占，
+    # 于是两个看门狗互相抢杀服务。宁可留着文件让它自证身份。
     try:
-        WEB_PID.unlink()
+        time.sleep(0.5)
+        still_alive = False
+        if sup_pid:
+            try:
+                os.kill(sup_pid, 0)
+                still_alive = True
+            except Exception:
+                still_alive = False
+        if not still_alive:
+            WEB_PID.unlink()
     except Exception:
         pass
     time.sleep(1)
     try:
-        subprocess.run(["pkill", "-9", "-f", "agent.py web --serve"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        subprocess.run(["pkill", "-9", "-f", "supervisor.sh"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if os.name == "nt":
+            # Windows 没有 pkill：用 taskkill 按命令行特征清理
+            for pat in ("agent.py", "supervisor"):
+                subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "Get-CimInstance Win32_Process | "
+                     "Where-Object { $_.CommandLine -like '*%s*' -and $_.ProcessId -ne %d } | "
+                     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+                     % (pat, os.getpid())],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+        else:
+            subprocess.run(["pkill", "-9", "-f", "agent.py web --serve"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            subprocess.run(["pkill", "-9", "-f", "supervisor.sh"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            subprocess.run(["pkill", "-9", "-f", "supervisor.py"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except Exception as e:
         print(red(f"  停止服务时出错：{e}"))
 
@@ -11829,9 +12445,42 @@ def _stop_server() -> int:
     time.sleep(1.5)
     left = []
     try:
+        # 不能只看 pgrep 的匹配结果 —— `pgrep -f` 匹配的是**整条命令行文本**，
+        # 而执行 pgrep 的那个 shell/python 进程，它的命令行里恰恰就含
+        # "agent.py web --serve" 这个搜索词，于是它自己被算成一个"没停掉的服务"，
+        # 必然导致这里误报「还有 1 个服务进程没停下来」。
+        # 加 [a] 也救不了：那只是让**书写者**不自匹配，调用方命令行里写什么仍然照算。
+        # 正确做法：逐个读 /proc/<pid>/cmdline，只认「真的是 python 在跑 agent.py」的进程。
         r = subprocess.run(["pgrep", "-f", "agent.py web --serve"],
                            capture_output=True, text=True, timeout=10)
-        left = [x for x in (r.stdout or "").split() if x.strip()]
+        me = os.getpid()
+        for x in (r.stdout or "").split():
+            x = x.strip()
+            if not x or not x.isdigit():
+                continue
+            if int(x) == me:
+                continue
+            try:
+                with open("/proc/%s/cmdline" % x, "rb") as _f:
+                    argv = _f.read().decode("utf-8", "replace").split("\0")
+            except Exception:
+                continue          # 读不到（已是僵尸/无权限）就当它不存在
+            # 判据必须看 **argv 结构**，不能只看"含哪些词"：
+            # 真服务是 `python3 /path/agent.py web --serve`，argv[0] 是解释器、
+            # argv[1] 是 agent.py。而一条 `bash -c '…python3…agent.py web --serve…'`
+            # 的命令行里同样含这四个词，只做子串匹配就会把它误判成服务
+            # （实测踩到过）。所以要求 argv[0] 是 python 且 argv[1] 以 agent.py 结尾。
+            args = [a for a in argv if a]
+            if len(args) < 4:
+                continue
+            if "python" not in os.path.basename(args[0]):
+                continue
+            if not args[1].replace("\\", "/").endswith("/agent.py"):
+                continue
+            rest = " ".join(args[2:])
+            if "web" not in rest or "--serve" not in rest:
+                continue
+            left.append(x)
     except Exception:
         pass
     if left:
@@ -12467,6 +13116,22 @@ def cmd_web(cfg: dict, args) -> int:
     except Exception:
         pass
 
+    # 启动时扫一遍本文件有没有重复定义的顶层函数/类。
+    # 由来：自己改自己的代码时新函数插错位置、旧函数没删干净，同名函数被定义两次，
+    # Python 静默取最后一个 —— 看代码是新的、跑的却是旧的，极易误判。只告警不改动。
+    try:
+        _dups = _check_dup_defs()
+        if _dups:
+            _msg = "；".join(f"{n}（行 {','.join(map(str, ls))}）" for n, ls in _dups)
+            print(f"  [警告] agent.py 存在重复定义：{_msg}")
+            try:
+                with open(APP_DIR / "dup-defs.log", "a", encoding="utf-8") as _f:
+                    _f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {_msg}\n")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     if getattr(args, "stop", False):
         return _stop_server()
 
@@ -12499,6 +13164,35 @@ def cmd_web(cfg: dict, args) -> int:
     if not cfg.get("api_key"):
         print(red("未配置 API Key。请执行： agent config"))
         return 2
+
+    # ---- 单实例锁（flock）----
+    # 为什么必须有：以前只靠「先探测 /api/state 通不通，再 bind」来防重复启动，
+    # 但两个实例可能同时探测到"没人在跑"、然后都去 bind —— 先 bind 的赢，
+    # 后 bind 的 6 次重试全失败，退出码 1。看门狗看到"服务异常"就去拉新的，
+    # 而赢家还好好活着 → 两个看门狗互相抢杀服务，形成无限重启循环。
+    # flock 是内核级锁，且进程退出（含被 SIGKILL）时自动释放，没有陈旧锁问题。
+    # 关键：锁要在 bind **之前**拿，否则时间窗依然存在。
+    _lock_fd = None
+    try:
+        import fcntl
+        _lock_path = APP_DIR / "web.lock"
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        _lock_fd = os.open(str(_lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # 拿不到锁 = 已经有一个服务实例在跑。这不是错误，本进程安静退出，
+            # 退出码给 0，免得看门狗把它当成"服务崩了"又去拉新的。
+            os.close(_lock_fd)
+            _lock_fd = None
+            print(green(f"  已经在运行 → {url}（另一实例持有锁）"))
+            if not no_open:
+                _open_url(url)
+            return 0
+        os.write(_lock_fd, str(os.getpid()).encode())
+    except Exception:
+        # 不支持 flock 的环境不阻塞启动，退回到老行为
+        _lock_fd = None
 
     # 固定端口：绝不自动换端口，否则"添加到主屏幕"的书签会失效。
     # 注意要用 SO_REUSEADDR（和真正服务器一致），否则 TIME_WAIT 残留连接会被误判为"端口被占用"。
@@ -12585,13 +13279,20 @@ def cmd_web(cfg: dict, args) -> int:
                 except Exception:
                     pass
                 try:
-                    subprocess.Popen(["termux-wake-lock"], stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
+                    if shutil.which("termux-wake-lock"):   # 仅 Termux 有；其他平台跳过
+                        subprocess.Popen(["termux-wake-lock"], stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
                 try:
-                    os.execv("/data/data/com.termux/files/usr/bin/bash",
-                             ["bash", str(SUPERVISOR)])
+                    # 看门狗用哪个解释器：bash 版用 shell，Python 版用 python
+                    # （Windows 没 bash，SUPERVISOR 会是 supervisor.py）
+                    if SUPERVISOR_CODE is not None:
+                        _exe = sys.executable or (_pl_python_exe() if _pl_python_exe else "python3")
+                        os.execv(_exe, [_exe, str(SUPERVISOR)])
+                    else:
+                        _sh = termux_shell()
+                        os.execv(_sh, [os.path.basename(_sh), str(SUPERVISOR)])
                 except Exception:
                     pass
                 os._exit(0)
@@ -12599,27 +13300,35 @@ def cmd_web(cfg: dict, args) -> int:
             foreground = True          # 非 POSIX（比如在电脑上跑）就留在前台
 
     # ---- 后台进化调度 + 唤醒锁保活 + adb 通道维护（只在提供服务的那层进程里跑）
-    threading.Thread(target=_evolve_loop, args=(state, cfg), daemon=True).start()
+    # evolve 与 selfheal 都会读改 agent.py，构成"第二个写者"。手工改代码期间必须能一键关掉，
+    # 否则改动会被它们覆盖（2026-10-01 踩过：一期改动被回滚两次，详见 skills/termux-traps.md）。
+    _writers_on = bool(cfg.get("selfheal_enabled", True))
+    if _writers_on:
+        threading.Thread(target=_evolve_loop, args=(state, cfg), daemon=True).start()
     threading.Thread(target=wake_lock_loop, daemon=True).start()
     threading.Thread(target=adb_keepalive_loop, daemon=True).start()
 
     # ---- 自愈与续跑（实现在 selfheal.py）：
     # 捕获崩溃 → 自动开个静默会话定位并 selfupdate 修复（带指纹去重与限流）；
     # 任务中断（服务重启 / 轮次达上限）→ 自动接着做完，每会话有次数上限。
-    try:
-        import selfheal as _selfheal
-        _selfheal.install(
-            state, cfg,
-            make_agent=lambda: Agent(cfg, Approver(cfg, assume_yes=True, interactive=False),
-                                     show_reasoning=False),
-            agent_of=lambda st: _agent_of(st, None),
-            load_todo=load_todo,
-            broadcast=ws_broadcast,
-            log_change=log_change,
-            logger=_evolve_log,
-        )
-    except Exception:
-        pass
+    # 开关 cfg["selfheal_enabled"]（默认 True）：关掉后两者都不启动，agent.py 不再有人抢着写。
+    if _writers_on:
+        try:
+            import selfheal as _selfheal
+            _selfheal.install(
+                state, cfg,
+                make_agent=lambda: Agent(cfg, Approver(cfg, assume_yes=True, interactive=False),
+                                         show_reasoning=False),
+                agent_of=lambda st: _agent_of(st, None),
+                load_todo=load_todo,
+                broadcast=ws_broadcast,
+                log_change=log_change,
+                logger=_evolve_log,
+            )
+        except Exception:
+            pass
+    else:
+        print(dim("  自愈/进化已关闭（selfheal_enabled=False）—— 手工改代码时为安全默认"))
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -12628,10 +13337,27 @@ def cmd_web(cfg: dict, args) -> int:
             # 默认静音；只把「页面加载 / 面板拉取 / WS 连接」记到 access.log，用于排查前端问题
             try:
                 line = (fmt % args) if args else str(fmt)
-                if ("GET / HTTP" in line) or ("/api/panel" in line) or ("/ws" in line):
-                    p = os.path.expanduser("~/.termux-agent/access.log")
-                    if os.path.exists(p) and os.path.getsize(p) > 512 * 1024:
-                        os.remove(p)                 # 简单滚动，别让它无限长
+                if ("GET / HTTP" in line) or ("/api/panel" in line) or ("GET /ws" in line):
+                    # 2026-10-01 修：原来写死 ~/.termux-agent/access.log，
+                    # 但 Windows 上应用目录是 %USERPROFILE%\.sidekick —— 结果那边
+                    # access.log 从来没生成过，WS 掉线/页面请求全查不到。
+                    # 一律走 APP_DIR（平台层已按系统选好路径）。
+                    p = str(APP_DIR / "access.log")
+                    # 滚动：保留后半截，不要 os.remove 整删。
+                    # 2026-10-01 踩坑：整删文件时旧日志句柄还开着，新写的第一行会和
+                    # 缓冲区里残留的半行粘在一起，access.log 首行就变成没有日期前缀的
+                    # 半截记录（表现为「15:08:19 "GET /api/panel ...」）。改成重写后
+                    # 半截行统一丢弃，首行必定完整。
+                    try:
+                        if os.path.exists(p) and os.path.getsize(p) > 512 * 1024:
+                            with open(p, "rb") as f:
+                                f.seek(-256 * 1024, os.SEEK_END)
+                                f.readline()             # 丢掉可能不全的首行
+                                keep = f.read()
+                            with open(p, "wb") as f:
+                                f.write(keep)
+                    except Exception:
+                        pass
                     with open(p, "a", encoding="utf-8") as f:
                         f.write(time.strftime("%m-%d %H:%M:%S ") + line + "\n")
             except Exception:
@@ -12667,6 +13393,17 @@ def cmd_web(cfg: dict, args) -> int:
                 self.wfile.flush()
             except Exception:
                 return
+            # 2026-10-01 补记：握手是裸写 socket 的，不走 log_request()，所以 access.log
+            # 里从来没有过 /ws 的痕迹（原来的过滤条件 "/ws" in line 永远匹配不到，
+            # 生成的行里根本没有 "/ws" 字符串）。WS 掉线是最难查的一类问题，
+            # 这里补一行手写日志，格式和普通记录保持一致，便于对着 restart.log 看断连。
+            try:
+                _lp = str(APP_DIR / "access.log")   # 同上：不能写死 ~/.termux-agent
+                with open(_lp, "a", encoding="utf-8") as _lf:
+                    _lf.write(time.strftime("%m-%d %H:%M:%S ")
+                              + '"GET /ws HTTP/1.1" 101 -\n')
+            except Exception:
+                pass
 
             outq: "queue.Queue" = queue.Queue()
             sock = self.connection
@@ -12687,7 +13424,10 @@ def cmd_web(cfg: dict, args) -> int:
             wt = threading.Thread(target=writer, daemon=True)
             wt.start()
             WS_CLIENTS.add(outq)
-            turn = {"stop": threading.Event(), "busy": False}
+            # started_sid = 本轮是在哪个会话里发起的。收尾推送靠它判定该把结果推给谁：
+            # 只比 conn["sid"] 会漏 —— 用户发完消息又切走/服务重启过，两个 sid 就对不上，
+            # 结果被静默丢弃（现象：通知响了、界面空白、刷新才有）。
+            turn = {"stop": threading.Event(), "busy": False, "started_sid": ""}
             conn = {"sid": state["agent"].session_id}      # 本连接在看哪个会话
             agent = _agent_of(state, conn) or state["agent"]
 
@@ -12747,6 +13487,10 @@ def cmd_web(cfg: dict, args) -> int:
                     return
                 stop_evt = threading.Event()
                 turn["stop"] = stop_evt
+                # 记下"这一轮是在哪个会话里发起的"。收尾时要靠它判定结果该推给谁：
+                # 只比 conn["sid"] 会漏（用户发完又切走、或服务重启过，两个 sid 就对不上，
+                # 结果被静默丢弃 —— 现象是通知响了、界面空白、刷新才有）。
+                turn["started_sid"] = agent.session_id
                 mark_last_session(agent.session_id)
 
                 def work():
@@ -12800,11 +13544,21 @@ def cmd_web(cfg: dict, args) -> int:
                         agent.stream_text = ""
                         # 只在「这个连接还看着这个会话」时才推会话专属内容；
                         # 否则用户正看着别的对话，这边一收尾就把他的视图拽回去。
-                        if conn.get("sid") == agent.session_id:
+                        # 判据必须带上 turn["started_sid"]：本轮是在哪个会话发起的。
+                        # 只比 conn["sid"] 会漏 —— 用户发完又切走、或服务重启过，
+                        # 两个 sid 就对不上，结果被静默丢弃（现象：通知响了、界面空白、
+                        # 刷新才有）。带上发起者后，自己发起的对话一定能收到结果。
+                        if conn.get("sid") in (agent.session_id, turn.get("started_sid")):
                             push("evt", {"k": "done", "v": ""})
                             push("hello", hello_payload(agent, agent.cfg))
                             push("history", {"sid": agent.session_id,
                                              "msgs": history_payload(agent)})
+                        else:
+                            # 判据不成立 = 本连接在看别的对话，结果故意不推（设计如此）。
+                            # 留一行日志，免得日后又出现"通知响了界面却是空的"时无从查起。
+                            print("[ws] 结果未推给本连接：conn.sid=%s agent.sid=%s started=%s"
+                                  % (conn.get("sid"), agent.session_id,
+                                     turn.get("started_sid")), flush=True)
                         push("sessions", sessions_payload(
                             agent, conn.get("sid") or agent.session_id))
                         _schedule_distill(state)
@@ -13716,6 +14470,12 @@ def cmd_web(cfg: dict, args) -> int:
     except OSError as e:
         print(red(f"启动失败：{e}"))
         return 1
+    # 端口绑上了 = 本次启动的代码至少能跑起来 → 解除 selfupdate 留下的
+    # no-rollback 保险（见 tool_selfupdate 第 5 步）。放在这里而不是启动更早处，
+    # 是因为要等服务"真的能对外服务"才敢让看门狗恢复回滚能力。
+    # 若绑端口失败（上面 return 1），标记会留着 —— 这正是想要的：
+    # 此时看门狗连试 3 次仍起不来，也不会把现场抹掉，方便人工看。
+    _clear_norollback("服务启动成功（boot_id %s）" % BOOT_ID)
     # 重启不丢任务：信号先落盘 + 从落盘对话推断上次是否被打断（见文件上方注释）
     install_exit_hooks()
     _why = write_resume_note_if_interrupted()
@@ -13743,11 +14503,12 @@ def cmd_web(cfg: dict, args) -> int:
         print(dim("\n  已停止"))
     finally:
         srv.server_close()
-        try:
-            if WEB_PID.exists() and WEB_PID.read_text().strip() == str(os.getpid()):
-                WEB_PID.unlink()
-        except Exception:
-            pass
+        # pid 文件（supervisor.pid）现在记的是【看门狗】的 pid，不是服务自己的，
+        # 所以这里不该删它：看门狗还活着要靠它自证身份（否则下一个看门狗会误判
+        # 「没有别的看门狗」而抢占，两个看门狗互相抢杀服务）；看门狗若已死，
+        # 该由 _stop_server 负责清理。历史那行「内容 == 自己 pid 才删」是死代码
+        # （两者永远不相等），已移除。
+        pass
     return 0
 
 
@@ -13954,6 +14715,7 @@ BOOT_SCRIPT = BOOT_DIR / "start-agent.sh"
 BOOT_SH = r"""#!/data/data/com.termux/files/usr/bin/bash
 # 开机自动拉起 Termux Agent（由 agent autostart 生成）
 # 依赖：安装 Termux:Boot 应用后，本目录下的脚本会在开机时自动执行。
+echo "$(date '+%F %T') 开机脚本被触发" >> "$HOME/.termux-agent/boot.log"
 sleep 8                                   # 等系统和网络就绪
 
 # 防休眠（需要 Termux:API；没装则静默无效，不影响启动）
@@ -13962,11 +14724,34 @@ if [ -x "$PREFIX/bin/termux-wake-lock" ]; then
 fi
 
 cd "$HOME" || exit 1
-# 已在运行就不重复启动
+
+# 已在运行就不重复启动（探测失败也别急着起，交给看门狗判断）
 if curl -sf -o /dev/null --max-time 3 http://127.0.0.1:8765/api/state; then
   exit 0
 fi
-exec "$PREFIX/bin/python3" "$HOME/.termux-agent/agent.py" web --no-open
+
+# 关键：**必须走看门狗**，不要直接 exec 服务进程。
+#   直接起服务 = 裸奔：崩了不自愈、改坏代码不回滚、而且用的参数是 `web --no-open`，
+#   看门狗判断存活用的是 `pgrep -f "agent.py web --serve"` —— 根本匹配不上这个进程，
+#   于是看门狗以为"服务没了"，只给 1 次宽限就再拉一个，两个服务抢 8765 端口，
+#   两个看门狗互相抢杀，形成无限重启循环。
+# 走 supervisor.sh 则：服务带 --serve 参数、由看门狗托管、健康检查与自动回滚全都有。
+#
+# 2026-10-01 教训（代价 843 次误回滚）：模板改错了会被 autostart 重新生成、
+#   把修好的脚本覆盖回旧版，而且当场看不出来。改这里必须同步验一遍生成结果。
+SUP="$HOME/.termux-agent/supervisor.sh"
+if [ ! -x "$SUP" ]; then
+  chmod +x "$SUP" 2>/dev/null
+fi
+if [ -x "$SUP" ]; then
+  # setsid 让它脱离本脚本的会话，脚本退出后看门狗继续活着
+  setsid "$SUP" >/dev/null 2>&1 &
+  exit 0
+fi
+
+# 兜底：万一看门狗脚本不在（异常情况），才退回直接启动，
+# 但参数必须用 --serve，否则又会被看门狗的 pgrep 漏掉。
+exec "$PREFIX/bin/python3" "$HOME/.termux-agent/agent.py" web --serve
 """
 
 
